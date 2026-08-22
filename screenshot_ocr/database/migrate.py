@@ -12,6 +12,7 @@ import os
 import sqlite3
 
 from . import repository
+from .importer import is_invalid_shop_name
 from .schema import DB_PATH, get_meta, set_meta
 from .matcher import normalize
 
@@ -27,7 +28,7 @@ def migrate_shop_city_db(old_db_path=None):
         old_db_path: 旧库路径，默认 data/shop_city.db
 
     Returns:
-        dict: {migrated: bool, shops, aliases, city_matches, source}
+        dict: {migrated: bool, shops, aliases, city_matches, ignored_rows, source}
     """
     if old_db_path is None:
         old_db_path = os.path.join(
@@ -37,11 +38,11 @@ def migrate_shop_city_db(old_db_path=None):
 
     if get_meta(MIGRATE_MARK):
         return {"migrated": False, "shops": 0, "aliases": 0,
-                "city_matches": 0, "source": "already_migrated"}
+                "city_matches": 0, "ignored_rows": 0, "source": "already_migrated"}
 
     if not os.path.exists(old_db_path):
         return {"migrated": False, "shops": 0, "aliases": 0,
-                "city_matches": 0, "source": "no_old_db"}
+                "city_matches": 0, "ignored_rows": 0, "source": "no_old_db"}
 
     conn = sqlite3.connect(old_db_path)
     conn.row_factory = sqlite3.Row
@@ -50,12 +51,14 @@ def migrate_shop_city_db(old_db_path=None):
     finally:
         conn.close()
 
-    shops = aliases = matches = 0
+    shops = aliases = matches = ignored_rows = 0
     for row in rows:
         shop_name = (row["shop_name"] or "").strip()
         city = (row["city"] or "").strip()
         src = row["source"] or "migrate"
-        if not shop_name:
+        if not shop_name or is_invalid_shop_name(shop_name):
+            ignored_rows += 1
+            logger.warning("skip invalid legacy shop name during migration: %s", shop_name)
             continue
         # 店铺 + 别名 + 城市（迁移视为历史人工确认）
         shop_id = repository.upsert_shop(shop_name, city, source="migrate", confidence=0.9)
@@ -67,4 +70,4 @@ def migrate_shop_city_db(old_db_path=None):
 
     set_meta(MIGRATE_MARK, "done")
     return {"migrated": True, "shops": shops, "aliases": aliases,
-            "city_matches": matches, "source": "migrated"}
+            "city_matches": matches, "ignored_rows": ignored_rows, "source": "migrated"}

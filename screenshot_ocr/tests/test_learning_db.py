@@ -151,6 +151,27 @@ def test_cleanup_invalid_imports():
     check("正常投喂店铺保留", database.repository.get_shop(normal_id) is not None)
 
 
+def test_migrate_skips_invalid_legacy_names():
+    print("== 旧库迁移校验 ==")
+    legacy_path = os.path.join(tempfile.gettempdir(), "legacy_shop_city_guard.db")
+    if os.path.exists(legacy_path):
+        os.remove(legacy_path)
+    import sqlite3
+    conn = sqlite3.connect(legacy_path)
+    conn.execute("CREATE TABLE shop_city (shop_name TEXT PRIMARY KEY, city TEXT, source TEXT)")
+    conn.execute("INSERT INTO shop_city VALUES (?, ?, ?)", ("迁移正常店铺", "广州市", "legacy"))
+    conn.execute("INSERT INTO shop_city VALUES (?, ?, ?)", ("500ml*12听", "佛山市", "legacy"))
+    conn.commit()
+    conn.close()
+
+    from database.migrate import MIGRATE_MARK
+    from database.schema import set_meta
+    set_meta(MIGRATE_MARK, "")
+    report = database.migrate_shop_city_db(legacy_path)
+    check("迁移仅保留有效店铺", report["shops"] == 1 and report["ignored_rows"] == 1)
+    check("迁移规格不会进入店铺库", database.repository.get_shop_any_source("500ml*12听") is None)
+
+
 def test_conflict():
     print("== 冲突检测与裁决 ==")
     database.learn_correction("双城超市", "双城超市", "广州市", operator="test")
@@ -190,6 +211,7 @@ if __name__ == "__main__":
     test_import_idempotent()
     test_import_rejects_summary_sheets_and_invalid_shop_names()
     test_cleanup_invalid_imports()
+    test_migrate_skips_invalid_legacy_names()
     test_conflict()
     test_alias_conflict_is_visible()
     test_migrate_idempotent()

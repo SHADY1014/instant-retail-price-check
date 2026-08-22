@@ -95,8 +95,8 @@ def import_excel(excel_path, operator="gui"):
     return importer.import_excel(excel_path, operator)
 
 
-def migrate_shop_city_db():
-    return migrate.migrate_shop_city_db()
+def migrate_shop_city_db(old_db_path=None):
+    return migrate.migrate_shop_city_db(old_db_path)
 
 
 def get_stats():
