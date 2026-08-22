@@ -151,6 +151,47 @@ def list_shops(limit=1000, offset=0):
             conn.close()
 
 
+def list_invalid_imported_shops():
+    """列出可安全清理的异常投喂或迁移店铺，供界面先预览再确认。"""
+    from .importer import is_invalid_shop_name
+
+    _ensure_init()
+    with _LOCK:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT s.* FROM shops s WHERE s.source IN ('import', 'migrate') OR EXISTS ("
+                "SELECT 1 FROM corrections c WHERE c.shop_id = s.shop_id "
+                "AND c.batch_id IS NOT NULL) ORDER BY s.shop_id"
+            ).fetchall()
+            return [dict(row) for row in rows if is_invalid_shop_name(row["canonical_name"])]
+        finally:
+            conn.close()
+
+
+def delete_invalid_imported_shops(shop_ids):
+    """删除用户确认的异常投喂或迁移店铺及其关联学习记录。"""
+    candidates = {row["shop_id"]: row for row in list_invalid_imported_shops()}
+    valid_ids = [shop_id for shop_id in shop_ids if shop_id in candidates]
+    if not valid_ids:
+        return []
+
+    placeholders = ", ".join("?" for _ in valid_ids)
+    _ensure_init()
+    with _LOCK:
+        conn = _conn()
+        try:
+            conn.execute(f"DELETE FROM corrections WHERE shop_id IN ({placeholders})", valid_ids)
+            conn.execute(f"DELETE FROM shops WHERE shop_id IN ({placeholders})", valid_ids)
+            conn.commit()
+            return [candidates[shop_id]["canonical_name"] for shop_id in valid_ids]
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
 def increment_shop_usage(shop_id, correct=False):
     _ensure_init()
     with _LOCK:

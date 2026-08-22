@@ -10,6 +10,7 @@
 import hashlib
 import logging
 import os
+import re
 
 from openpyxl import load_workbook
 
@@ -24,6 +25,18 @@ logger = logging.getLogger(__name__)
 # 投喂 Excel 的列（与巡查表 A~P 对应，0-based）
 COL_REGION = 1    # B: 所属区域（城市）
 COL_SHOP = 3      # D: 店铺名称
+
+_REGION_HEADERS = {"区域", "所属区域", "所属主要区域"}
+_SHOP_HEADERS = {"店铺", "店铺名称"}
+_NON_SHOP_NAMES = {
+    "规格", "产品规格", "合格线", "合格线元", "原价", "成交价", "产品原价",
+    "产品成交单价", "商品标价", "备注", "产品", "店名", "城市", "所属区域",
+}
+_PRODUCT_SPEC_PATTERN = re.compile(
+    r"(?:\d+(?:\.\d+)?\s*(?:ml|毫升|l|升|g|克|kg|千克|斤)|"
+    r"\d+\s*[x*×]\s*\d+\s*(?:听|瓶|罐|箱|包|袋|支|个))",
+    re.IGNORECASE,
+)
 
 
 def _file_hash(path):
@@ -44,6 +57,32 @@ def _extract_city(region_text):
     if not s.endswith("市"):
         s = s + "市"
     return s
+
+
+def _header_text(value):
+    """将表头归一化，用于兼容模板中的换行、空格和中英文括号。"""
+    return re.sub(r"[\s（）()]", "", str(value or "")).strip()
+
+
+def _is_inspection_sheet(sheet):
+    """只接受第 1 或第 2 行含区域和店铺字段的巡查明细表。"""
+    for row in (2, 1):
+        region_header = _header_text(sheet.cell(row=row, column=COL_REGION + 1).value)
+        shop_header = _header_text(sheet.cell(row=row, column=COL_SHOP + 1).value)
+        if region_header in _REGION_HEADERS and shop_header in _SHOP_HEADERS:
+            return True
+    return False
+
+
+def is_invalid_shop_name(value):
+    """识别明显不是店铺名称的表头、规格和数值，避免污染学习库。"""
+    name = str(value or "").strip()
+    normalized = _header_text(name).lower()
+    if not normalized or normalized in _NON_SHOP_NAMES:
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+)?", normalized):
+        return True
+    return bool(_PRODUCT_SPEC_PATTERN.search(normalized))
 
 
 def import_excel(excel_path, operator="gui"):
@@ -85,10 +124,17 @@ def import_excel(excel_path, operator="gui"):
         "total_rows": 0, "new_shops": 0, "new_aliases": 0,
         "updated_shops": 0, "updated_cities": 0, "conflicts": 0,
         "ignored_rows": 0,
-        "detail": {"created": [], "updated": [], "conflict": [], "ignored": []},
+        "detail": {
+            "created": [], "updated": [], "conflict": [], "ignored": [],
+            "skipped_sheets": [],
+        },
     }
 
     for sheet in wb.worksheets:
+        if not _is_inspection_sheet(sheet):
+            report["detail"]["skipped_sheets"].append(sheet.title)
+            logger.info("skip non-inspection worksheet: %s", sheet.title)
+            continue
         for row in range(3, sheet.max_row + 1):  # 第3行开始是数据
             shop_val = sheet.cell(row=row, column=COL_SHOP + 1).value
             region_val = sheet.cell(row=row, column=COL_REGION + 1).value
@@ -100,7 +146,7 @@ def import_excel(excel_path, operator="gui"):
 
             city = _extract_city(region_val)
             # 清洗后过短视为无效行
-            if len(normalize(shop_name)) < 2:
+            if len(normalize(shop_name)) < 2 or is_invalid_shop_name(shop_name):
                 report["ignored_rows"] += 1
                 report["detail"]["ignored"].append(shop_name)
                 continue

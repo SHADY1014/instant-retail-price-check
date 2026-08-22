@@ -113,6 +113,44 @@ def test_import_idempotent():
           after["shops"] == before["shops"] and after["aliases"] == before["aliases"])
 
 
+def test_import_rejects_summary_sheets_and_invalid_shop_names():
+    print("== 投喂表头与内容校验 ==")
+    wb_path = os.path.join(tempfile.gettempdir(), "feed_sheet_guard.xlsx")
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    detail = wb.active
+    detail.title = "巡查明细"
+    detail.append(["分公司", "所属主要区域", "平台", "店铺名称"])
+    detail.append(["", "所属主要区域", "", "店铺名称"])
+    detail.append(["", "广州市", "美团", "正常便利店"])
+    detail.append(["", "广州市", "美团", "500ml*12瓶"])
+    summary = wb.create_sheet("汇总")
+    summary.append(["汇总"])
+    summary.append(["序号", "规格", "合格线(元)", "产品规格"])
+    summary.append([1, "500ml*12瓶", 60, "500ml*12瓶"])
+    wb.save(wb_path)
+
+    report = database.import_excel(wb_path, operator="test")
+    check("只导入明细表中的有效店铺", report["total_rows"] == 1)
+    check("规格值被忽略", report["ignored_rows"] == 1)
+    check("汇总表被跳过", report["detail"]["skipped_sheets"] == ["汇总"])
+    check("正常店铺仍可匹配", database.get_shop_city("正常便利店")["city"] == "广州市")
+
+
+def test_cleanup_invalid_imports():
+    print("== 异常投喂清理 ==")
+    invalid_id = database.repository.upsert_shop("500ml*12瓶", source="import")
+    normal_id = database.repository.upsert_shop("保留的正常店铺", source="import")
+    candidates = database.list_invalid_imported_shops()
+    candidate_ids = {row["shop_id"] for row in candidates}
+    check("异常规格出现在清理预览", invalid_id in candidate_ids)
+    check("正常店铺不出现在清理预览", normal_id not in candidate_ids)
+    deleted = database.delete_invalid_imported_shops([invalid_id, normal_id])
+    check("只删除异常投喂项", deleted == ["500ml*12瓶"])
+    check("正常投喂店铺保留", database.repository.get_shop(normal_id) is not None)
+
+
 def test_conflict():
     print("== 冲突检测与裁决 ==")
     database.learn_correction("双城超市", "双城超市", "广州市", operator="test")
@@ -150,6 +188,8 @@ if __name__ == "__main__":
     test_match_levels()
     test_learn_loop()
     test_import_idempotent()
+    test_import_rejects_summary_sheets_and_invalid_shop_names()
+    test_cleanup_invalid_imports()
     test_conflict()
     test_alias_conflict_is_visible()
     test_migrate_idempotent()

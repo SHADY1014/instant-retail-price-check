@@ -26,7 +26,7 @@ __all__ = [
     "learn_correction", "resolve_conflict",
     "import_excel", "migrate_shop_city_db",
     "get_stats", "get_conflicts", "get_city_matches",
-    "list_shops", "list_aliases",
+    "list_shops", "list_aliases", "list_invalid_imported_shops", "delete_invalid_imported_shops",
     "list_corrections", "list_batches",
     "record_network_city_consent", "create_network_city_request",
     "record_network_city_candidates", "record_network_city_decisions",
@@ -118,6 +118,14 @@ def list_shops(limit=1000, offset=0):
 
 def list_aliases(limit=2000):
     return repository.list_aliases(limit)
+
+
+def list_invalid_imported_shops():
+    return repository.list_invalid_imported_shops()
+
+
+def delete_invalid_imported_shops(shop_ids):
+    return repository.delete_invalid_imported_shops(shop_ids)
 
 
 def list_corrections(limit=1000):
