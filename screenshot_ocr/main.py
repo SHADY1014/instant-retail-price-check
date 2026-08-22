@@ -1087,17 +1087,22 @@ class MainWindow(QWidget):
         )
         self.export_btn.clicked.connect(self._export_excel)
         export_layout.addWidget(self.export_btn)
-        export_layout.addStretch()
 
-        city_menu = QMenu(self)
-        city_menu.addAction("联网识别城市", self._network_detect_city)
-        city_menu.addAction("查重核查", self._check_duplicates)
-        city_tools = QToolButton()
-        city_tools.setText("城市与核查")
-        city_tools.setMenu(city_menu)
-        city_tools.setPopupMode(QToolButton.InstantPopup)
-        city_tools.setToolTip("城市联网识别和重复记录核查")
-        export_layout.addWidget(city_tools)
+        self.net_city_btn = QPushButton("🌐 联网识别城市")
+        self.net_city_btn.setToolTip(
+            "在选择的城市范围内搜索未匹配店铺；联网结果需确认后才会写入表格"
+        )
+        self.net_city_btn.clicked.connect(self._network_detect_city)
+        export_layout.addWidget(self.net_city_btn)
+
+        self.dedup_btn = QPushButton("🔍 查重核查")
+        self.dedup_btn.setToolTip(
+            "按店铺、平台、城市和理论成交价查找重复记录"
+        )
+        self.dedup_btn.clicked.connect(self._check_duplicates)
+        export_layout.addWidget(self.dedup_btn)
+
+        export_layout.addStretch()
 
         report_menu = QMenu(self)
         report_menu.addAction("生成汇总表（含截图）", self._generate_summary)
