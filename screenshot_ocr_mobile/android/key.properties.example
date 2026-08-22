@@ -1,0 +1,5 @@
+# Copy to android/key.properties on the release workstation. Do not commit it.
+storePassword=REPLACE_WITH_KEYSTORE_PASSWORD
+keyPassword=REPLACE_WITH_KEY_PASSWORD
+keyAlias=lq-price-check
+storeFile=/absolute/path/to/lq-price-check-release.jks

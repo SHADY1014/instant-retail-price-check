@@ -1,0 +1,15 @@
+# Python and PyInstaller output
+__pycache__/
+*.py[cod]
+build/
+dist/
+
+# User data, exports, and local tooling
+output/
+data/ocr_learning.db
+.DS_Store
+
+# Release signing material
+*.pfx
+*.p12
+*.cer

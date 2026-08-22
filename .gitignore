@@ -1,0 +1,44 @@
+# Operating system and editor files
+.DS_Store
+.idea/
+*.iml
+
+# Python runtime and test artifacts
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+**/.pytest_cache/
+**/.Codex/
+
+# Generated application data and reports
+/output/
+**/output/
+**/data/ocr_learning.db
+**/data/*.db-wal
+**/data/*.db-shm
+screenshot_ocr/data/.ocr_helper
+screenshot_ocr/data/.ocr_helper.hash
+screenshot_ocr/data/.ocr_helper.swift
+
+# Flutter and Android build artifacts
+screenshot_ocr_mobile/.dart_tool/
+screenshot_ocr_mobile/.flutter-plugins-dependencies
+screenshot_ocr_mobile/build/
+screenshot_ocr_mobile/android/build/
+screenshot_ocr_mobile/android/.gradle/
+screenshot_ocr_mobile/android/local.properties
+screenshot_ocr_mobile/android/app/.cxx/
+screenshot_ocr_mobile/android/key.properties
+screenshot_ocr_mobile/**/*.jks
+screenshot_ocr_mobile/**/*.keystore
+screenshot_ocr_mobile/*.apk
+
+# Windows packaged artifacts and local installers
+*.exe
+screenshot_ocr_windows/build/
+screenshot_ocr_windows/dist/
+screenshot_ocr_windows/python-*-amd64.exe
+screenshot_ocr_windows/vc_redist.x64.exe
+screenshot_ocr_windows/**/*.pfx
+screenshot_ocr_windows/**/*.p12
+screenshot_ocr_windows/**/*.cer
