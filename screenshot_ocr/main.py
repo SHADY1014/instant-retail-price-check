@@ -975,6 +975,7 @@ class MainWindow(QWidget):
         self.setStyleSheet(
             "QWidget { font-family: 'Microsoft YaHei UI', 'PingFang SC', "
             "'Heiti SC', 'Arial Unicode MS'; font-size: 13px; }"
+            "QPushButton, QToolButton { border-radius: 4px; padding: 0 12px; }"
         )
 
         layout = QVBoxLayout(self)
@@ -996,7 +997,7 @@ class MainWindow(QWidget):
         btn_layout.addWidget(self.zip_btn)
 
         self.paste_btn = QPushButton("📋 粘贴截图")
-        self.paste_btn.setStyleSheet("background: #27AE60; color: white; padding: 4px 12px;")
+        self.paste_btn.setStyleSheet("background: #27AE60; color: white;")
         self.paste_btn.setToolTip("从剪贴板粘贴截图（Ctrl+V）")
         self.paste_btn.clicked.connect(self._paste_from_clipboard)
         btn_layout.addWidget(self.paste_btn)
@@ -1006,7 +1007,7 @@ class MainWindow(QWidget):
         btn_layout.addWidget(self.clear_btn)
 
         self.ocr_btn = QPushButton("🔍 开始 OCR 识别")
-        self.ocr_btn.setStyleSheet("font-weight: bold; background: #0070C0; color: white; padding: 6px 20px;")
+        self.ocr_btn.setStyleSheet("font-weight: bold; background: #0070C0; color: white;")
         self.ocr_btn.clicked.connect(self._start_ocr)
         btn_layout.addWidget(self.ocr_btn)
 
@@ -1083,7 +1084,7 @@ class MainWindow(QWidget):
 
         self.export_btn = QPushButton("📋 导出 Excel")
         self.export_btn.setStyleSheet(
-            "font-weight: bold; background: #008040; color: white; padding: 6px 20px;"
+            "font-weight: bold; background: #008040; color: white;"
         )
         self.export_btn.clicked.connect(self._export_excel)
         export_layout.addWidget(self.export_btn)
@@ -1122,6 +1123,15 @@ class MainWindow(QWidget):
         data_tools.setPopupMode(QToolButton.InstantPopup)
         data_tools.setToolTip("查看和维护店铺城市学习库")
         export_layout.addWidget(data_tools)
+
+        # 工具栏按钮统一高度；宽度随文字内容伸缩，避免窄屏时截断文字。
+        for button in (
+            self.add_btn, self.zip_btn, self.paste_btn, self.clear_btn,
+            self.ocr_btn, self.cancel_ocr_btn, self.retry_ocr_btn,
+            self.export_btn, self.net_city_btn, self.dedup_btn,
+            report_tools, data_tools,
+        ):
+            button.setFixedHeight(32)
 
         result_layout.addLayout(export_layout)
 
