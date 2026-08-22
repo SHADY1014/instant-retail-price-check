@@ -1,5 +1,5 @@
 """
-美团截图 OCR 自动填表系统 - PyQt5 桌面 GUI
+即时零售截图价格核查工具 - PyQt5 桌面 GUI
 
 使用流程：
   1. 导入美团截图（拖拽/选择/压缩包）
@@ -963,7 +963,7 @@ class MainWindow(QWidget):
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("美团截图 OCR 自动填表系统")
+        self.setWindowTitle("即时零售截图价格核查")
         # 保留足够的表格可用空间，同时允许较小分辨率的笔记本正常显示。
         self.setMinimumSize(960, 640)
         screen = QApplication.primaryScreen()
