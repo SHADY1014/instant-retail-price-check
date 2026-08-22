@@ -17,10 +17,11 @@ import sys
 import tempfile
 import threading
 import zipfile
+from threading import Event
 from datetime import datetime
 
 from PyQt5.QtCore import Qt, QThread, QSize, pyqtSignal
-from PyQt5.QtGui import QPixmap, QKeySequence
+from PyQt5.QtGui import QColor, QPixmap, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -36,8 +37,10 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QMenu,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QListWidget,
     QListWidgetItem,
     QVBoxLayout,
@@ -50,6 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from city_pool import format_region, get_cities, get_provinces
 from ocr_engine import run_ocr_parallel
 from field_parser import FormFields, parse_ocr_to_fields, detect_brand
+from review_rules import find_review_issues
 from city_detector import detect_city_in_region
 import summary_generator
 import summary_speech
@@ -111,18 +115,23 @@ class OCRWorker(QThread):
     """后台 OCR 识别线程"""
 
     progress = pyqtSignal(int, int, str)  # current, total, message
-    finished_ocr = pyqtSignal(dict)       # {image_path: FormFields}
+    finished_ocr = pyqtSignal(dict, list, bool)
 
     def __init__(self, image_paths):
         super().__init__()
         self.image_paths = image_paths
+        self._cancel_event = Event()
+
+    def cancel(self):
+        """Request cooperative cancellation after currently running OCR calls."""
+        self._cancel_event.set()
 
     def run(self):
         results = {}
         total = len(self.image_paths)
         if total == 0:
             self.progress.emit(total, total, "识别完成")
-            self.finished_ocr.emit(results)
+            self.finished_ocr.emit(results, [], False)
             return
 
         # Vision OCR 并行批量识别（8 workers，吞吐约 2.5 倍于串行）
@@ -136,19 +145,30 @@ class OCRWorker(QThread):
                     message = "识别完成"
                 self.progress.emit(done, _total, message)
 
-        ocr_map = run_ocr_parallel(self.image_paths, progress_callback=on_done)
+        ocr_map = run_ocr_parallel(
+            self.image_paths,
+            progress_callback=on_done,
+            should_cancel=self._cancel_event.is_set,
+        )
 
+        retry_paths = []
         for path in self.image_paths:
             ocr_data = ocr_map.get(path)
-            if isinstance(ocr_data, dict) and "error" in ocr_data:
+            if ocr_data is None:
+                fields = FormFields()
+                fields.remark = "OCR 未完成：已取消，可重试"
+                retry_paths.append(path)
+            elif isinstance(ocr_data, dict) and "error" in ocr_data:
                 fields = FormFields()
                 fields.remark = f"OCR失败: {ocr_data['error']}"
+                retry_paths.append(path)
             else:
                 fields = parse_ocr_to_fields(ocr_data)
             results[path] = fields
 
-        self.progress.emit(total, total, "识别完成")
-        self.finished_ocr.emit(results)
+        message = "识别已取消" if self._cancel_event.is_set() else "识别完成"
+        self.progress.emit(len(ocr_map), total, message)
+        self.finished_ocr.emit(results, retry_paths, self._cancel_event.is_set())
 
 
 class CityDetectWorker(QThread):
@@ -439,6 +459,52 @@ class RegionNetworkWorker(QThread):
             time.sleep(0.3)
 
         self.finished_cities.emit(results)
+
+
+class NetworkCityReviewDialog(QDialog):
+    """Confirm network city candidates before writing them to the table."""
+
+    def __init__(self, candidates, allowed_cities, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("确认联网识别城市")
+        self.setMinimumSize(640, 360)
+        self._city_choices = {}
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "请确认每家店铺的候选城市。留空表示不采用该候选；"
+            "仅可选择本次已授权的城市范围。"
+        ))
+        table = QTableWidget(len(candidates), 3)
+        table.setHorizontalHeaderLabels(["店铺", "系统候选", "确认城市"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        for row, shop_name in enumerate(sorted(candidates)):
+            candidate = candidates[shop_name]
+            table.setItem(row, 0, QTableWidgetItem(shop_name))
+            table.setItem(row, 1, QTableWidgetItem(candidate or "未找到"))
+            combo = QComboBox()
+            combo.addItem("不采用")
+            combo.addItems(sorted(allowed_cities))
+            if candidate and candidate in allowed_cities:
+                combo.setCurrentText(candidate)
+            self._city_choices[shop_name] = combo
+            table.setCellWidget(row, 2, combo)
+        layout.addWidget(table)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("确认并填入")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_decisions(self):
+        return {
+            shop_name: combo.currentText() if combo.currentIndex() > 0 else ""
+            for shop_name, combo in self._city_choices.items()
+        }
 
 
 class RegionSelectDialog(QDialog):
@@ -885,9 +951,14 @@ class MainWindow(QWidget):
         self.image_paths = []
         self.ocr_results = {}  # {image_path: FormFields}
         self.ocr_worker = None
+        self._retry_paths = []
+        self._ocr_is_retry = False
         self._temp_dirs = []  # 压缩包解压的临时目录，退出时清理
         self._last_province = ""  # 用户上次选的省份，用于 BatchCityDialog 预填
         self._last_cities = set()  # 用户上次选的城市集合
+        self._updating_review_state = False
+        self._network_consent_at = self._load_network_consent()
+        self._network_request_id = None
 
         self.init_ui()
 
@@ -939,6 +1010,16 @@ class MainWindow(QWidget):
         self.ocr_btn.clicked.connect(self._start_ocr)
         btn_layout.addWidget(self.ocr_btn)
 
+        self.cancel_ocr_btn = QPushButton("取消识别")
+        self.cancel_ocr_btn.setEnabled(False)
+        self.cancel_ocr_btn.clicked.connect(self._cancel_ocr)
+        btn_layout.addWidget(self.cancel_ocr_btn)
+
+        self.retry_ocr_btn = QPushButton("重试失败项")
+        self.retry_ocr_btn.setEnabled(False)
+        self.retry_ocr_btn.clicked.connect(self._retry_failed_ocr)
+        btn_layout.addWidget(self.retry_ocr_btn)
+
         btn_layout.addStretch()
 
         self.file_count_label = QLabel("未选择图片")
@@ -957,8 +1038,20 @@ class MainWindow(QWidget):
         layout.addWidget(img_group)
 
         # ========== 下部：识别结果表格 ==========
-        result_group = QGroupBox("② 识别结果（可手动修正，所属区域可逐行编辑）")
+        result_group = QGroupBox("② 识别与核对（可手动修正，所属区域可逐行编辑）")
         result_layout = QVBoxLayout(result_group)
+
+        review_layout = QHBoxLayout()
+        self.review_summary_label = QLabel("尚未识别记录")
+        self.review_summary_label.setStyleSheet("font-weight: bold; color: #555;")
+        review_layout.addWidget(self.review_summary_label)
+        review_layout.addStretch()
+        self.review_filter = QCheckBox("仅看待核对")
+        self.review_filter.setEnabled(False)
+        self.review_filter.setToolTip("显示缺少关键字段或 OCR 识别失败的记录")
+        self.review_filter.toggled.connect(self._refresh_review_state)
+        review_layout.addWidget(self.review_filter)
+        result_layout.addLayout(review_layout)
 
         self.table = QTableWidget()
         col_count = len(TABLE_COLUMNS) + 1  # +1 for 图片列
@@ -972,6 +1065,7 @@ class MainWindow(QWidget):
         # 允许复制：选中整行/单元格后 Ctrl+C 复制
         self.table.setSelectionBehavior(QTableWidget.SelectItems)
         self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.itemChanged.connect(self._on_table_item_changed)
         # 添加 Ctrl+C 复制快捷键
         from PyQt5.QtWidgets import QShortcut
         copy_shortcut = QShortcut(QKeySequence.Copy, self.table)
@@ -981,62 +1075,48 @@ class MainWindow(QWidget):
         paste_shortcut.activated.connect(self._paste_from_clipboard)
         result_layout.addWidget(self.table)
 
-        # 导出区
+        # ③ 导出与辅助工具：仅保留导出为主操作，低频功能按业务分组。
         export_layout = QHBoxLayout()
-
-        export_label = QLabel("导出模式: 自动按品牌分类到4个子表（燕京/雪花/青岛/百威）")
+        export_label = QLabel("③ 导出：完成核对后生成巡查表")
         export_label.setStyleSheet("color: #666; font-size: 12px;")
         export_layout.addWidget(export_label)
 
-        export_layout.addStretch()
-
-        # 生成汇总表按钮（分省+分地级市+明细含截图）
-        self.summary_btn = QPushButton("📈 生成汇总表（含截图）")
-        self.summary_btn.setStyleSheet("font-weight: bold; background: #C00000; color: white; padding: 6px 20px;")
-        self.summary_btn.setToolTip("从已导出的巡查表xlsx生成汇总报告\n含: 分省汇总 / 分地级市汇总 / 明细表(附截图)")
-        self.summary_btn.clicked.connect(self._generate_summary)
-        export_layout.addWidget(self.summary_btn)
-
-        # 生成总结话术按钮
-        self.speech_btn = QPushButton("📝 生成总结话术")
-        self.speech_btn.setStyleSheet("font-weight: bold; background: #6A1B9A; color: white; padding: 6px 20px;")
-        self.speech_btn.setToolTip("从已导出的巡查表xlsx智能生成汇报话术\n按省份->城市->平台分组，列出不合格店铺")
-        self.speech_btn.clicked.connect(self._generate_speech)
-        export_layout.addWidget(self.speech_btn)
-
-        self.net_city_btn = QPushButton("🌐 联网识别城市")
-        self.net_city_btn.setStyleSheet("font-weight: bold; background: #E65100; color: white; padding: 6px 20px;")
-        self.net_city_btn.setToolTip(
-            "选择省份+城市后，对未识别城市的店铺在选定区域内联网搜索\n"
-            "避免同名道路跨城市误判（如广州/贵阳都有金融城）"
-        )
-        self.net_city_btn.clicked.connect(self._network_detect_city)
-        export_layout.addWidget(self.net_city_btn)
-
-        self.dedup_btn = QPushButton("🔍 查重核查")
-        self.dedup_btn.setStyleSheet("font-weight: bold; background: #6A1B9A; color: white; padding: 6px 20px;")
-        self.dedup_btn.setToolTip(
-            "导出前核查重复项\n"
-            "口径：店铺名 + 平台 + 城市 + 理论成交价（成交价−配送费）四者相同视为重复\n"
-            "列出重复组，勾选要删除的行，保留指定一条"
-        )
-        self.dedup_btn.clicked.connect(self._check_duplicates)
-        export_layout.addWidget(self.dedup_btn)
-
         self.export_btn = QPushButton("📋 导出 Excel")
-        self.export_btn.setStyleSheet("font-weight: bold; background: #008040; color: white; padding: 6px 20px;")
+        self.export_btn.setStyleSheet(
+            "font-weight: bold; background: #008040; color: white; padding: 6px 20px;"
+        )
         self.export_btn.clicked.connect(self._export_excel)
         export_layout.addWidget(self.export_btn)
+        export_layout.addStretch()
 
-        self.kb_btn = QPushButton("📚 知识库")
-        self.kb_btn.setStyleSheet("font-weight: bold; background: #37474F; color: white; padding: 6px 20px;")
-        self.kb_btn.setToolTip(
-            "店铺/城市智能匹配数据库\n"
-            "查看统计 / 导入人工修正的Excel / 查看店铺·别名·冲突·学习记录 / 重新匹配\n"
-            "人工修正一次，系统以后尽可能记住"
-        )
-        self.kb_btn.clicked.connect(self._open_knowledge_base)
-        export_layout.addWidget(self.kb_btn)
+        city_menu = QMenu(self)
+        city_menu.addAction("联网识别城市", self._network_detect_city)
+        city_menu.addAction("查重核查", self._check_duplicates)
+        city_tools = QToolButton()
+        city_tools.setText("城市与核查")
+        city_tools.setMenu(city_menu)
+        city_tools.setPopupMode(QToolButton.InstantPopup)
+        city_tools.setToolTip("城市联网识别和重复记录核查")
+        export_layout.addWidget(city_tools)
+
+        report_menu = QMenu(self)
+        report_menu.addAction("生成汇总表（含截图）", self._generate_summary)
+        report_menu.addAction("生成总结话术", self._generate_speech)
+        report_tools = QToolButton()
+        report_tools.setText("导出与汇总")
+        report_tools.setMenu(report_menu)
+        report_tools.setPopupMode(QToolButton.InstantPopup)
+        report_tools.setToolTip("基于已导出的巡查表生成汇总或话术")
+        export_layout.addWidget(report_tools)
+
+        data_menu = QMenu(self)
+        data_menu.addAction("打开知识库", self._open_knowledge_base)
+        data_tools = QToolButton()
+        data_tools.setText("数据管理")
+        data_tools.setMenu(data_menu)
+        data_tools.setPopupMode(QToolButton.InstantPopup)
+        data_tools.setToolTip("查看和维护店铺城市学习库")
+        export_layout.addWidget(data_tools)
 
         result_layout.addLayout(export_layout)
 
@@ -1048,8 +1128,13 @@ class MainWindow(QWidget):
         signature.setStyleSheet("color: #999; font-size: 11px; padding: 2px 8px;")
         layout.addWidget(signature)
 
-    # 联网识别隐私告知缓存：首次联网前提示用户，用户同意后不再重复弹窗
-    _network_consent_given = False
+    def _load_network_consent(self):
+        """Load an earlier local authorization without storing any screenshot data."""
+        try:
+            from database.schema import get_meta
+            return get_meta("network_city_consent_at", "")
+        except Exception:
+            return ""
 
     def _network_detect_city(self):
         """联网识别城市：用户先选省份+城市，再对未识别店铺在选定区域内联网搜索"""
@@ -1058,7 +1143,7 @@ class MainWindow(QWidget):
             return
 
         # 首次联网前告知用户隐私信息
-        if not MainWindow._network_consent_given:
+        if not self._network_consent_at:
             reply = QMessageBox.question(
                 self, "联网识别告知",
                 "联网识别会将店铺名称发送至百度地图接口进行搜索。\n"
@@ -1068,7 +1153,12 @@ class MainWindow(QWidget):
             )
             if reply == QMessageBox.No:
                 return
-            MainWindow._network_consent_given = True
+            try:
+                import database
+                self._network_consent_at = database.record_network_city_consent()
+            except Exception as exc:
+                QMessageBox.warning(self, "联网识别不可用", f"无法记录授权信息：{exc}")
+                return
 
         # 收集未识别城市的唯一店铺名
         unmatched = set()
@@ -1093,6 +1183,15 @@ class MainWindow(QWidget):
         if not restrict_cities:
             return
 
+        try:
+            import database
+            self._network_request_id = database.create_network_city_request(
+                self._network_consent_at, restrict_cities, unmatched
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "联网识别不可用", f"无法创建审计记录：{exc}")
+            return
+
         # 启动后台联网识别线程
         self._region_worker = RegionNetworkWorker(sorted(unmatched), restrict_cities)
         self._region_worker.progress.connect(
@@ -1103,9 +1202,37 @@ class MainWindow(QWidget):
         self.status_label.setText("联网识别中，请稍候...")
 
     def _on_region_cities_detected(self, shop_to_city):
-        """联网识别完成回调：填入识别到的城市"""
-        if not shop_to_city:
-            self.status_label.setText("联网识别未找到任何城市")
+        """Record candidates, then apply only user-confirmed city decisions."""
+        if not self._network_request_id:
+            self.status_label.setText("联网识别完成，但审计请求不存在")
+            return
+
+        all_candidates = {
+            shop: shop_to_city.get(shop, "")
+            for shop in self._region_worker.shop_names
+        }
+        try:
+            import database
+            database.record_network_city_candidates(
+                self._network_request_id, all_candidates, source="region_match"
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "审计记录失败", str(exc))
+            return
+
+        dialog = NetworkCityReviewDialog(
+            all_candidates, self._region_worker.restrict_cities, self
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            self.status_label.setText("已保留联网候选，未应用任何城市结果")
+            return
+        shop_to_city = dialog.get_decisions()
+        try:
+            database.record_network_city_decisions(
+                self._network_request_id, shop_to_city
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "审计记录失败", str(exc))
             return
 
         updated = 0
@@ -1302,7 +1429,10 @@ class MainWindow(QWidget):
     def _clear_files(self):
         self.image_paths.clear()
         self.ocr_results.clear()
+        self._retry_paths.clear()
+        self.retry_ocr_btn.setEnabled(False)
         self.table.setRowCount(0)
+        self._refresh_review_state()
         self._update_file_count()
         self.status_label.setText("")
         # 清理解压的临时目录
@@ -1327,31 +1457,70 @@ class MainWindow(QWidget):
         n = len(self.image_paths)
         self.file_count_label.setText(f"已选 {n} 张图片" if n > 0 else "未选择图片")
 
-    def _start_ocr(self):
-        if not self.image_paths:
+    def _start_ocr(self, retry=False):
+        if self.ocr_worker and self.ocr_worker.isRunning():
+            return
+        image_paths = self._retry_paths if retry else self.image_paths
+        if not image_paths:
             QMessageBox.warning(self, "提示", "请先导入美团截图")
             return
 
+        self._ocr_is_retry = retry
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.ocr_btn.setEnabled(False)
-        self.status_label.setText("开始识别...")
+        self.retry_ocr_btn.setEnabled(False)
+        self.cancel_ocr_btn.setEnabled(True)
+        self.status_label.setText(
+            f"正在重试 {len(image_paths)} 张失败图片..." if retry else "开始识别..."
+        )
 
-        self.ocr_worker = OCRWorker(self.image_paths)
+        self.ocr_worker = OCRWorker(image_paths)
         self.ocr_worker.progress.connect(self._on_ocr_progress)
         self.ocr_worker.finished_ocr.connect(self._on_ocr_finished)
         self.ocr_worker.start()
+
+    def _cancel_ocr(self):
+        """Stop scheduling new OCR work while preserving completed results."""
+        if self.ocr_worker and self.ocr_worker.isRunning():
+            self.ocr_worker.cancel()
+            self.cancel_ocr_btn.setEnabled(False)
+            self.status_label.setText("正在停止 OCR，当前已开始的图片会完成后保留...")
+
+    def _retry_failed_ocr(self):
+        """Retry only the images that failed or were not completed."""
+        self._start_ocr(retry=True)
 
     def _on_ocr_progress(self, current, total, message):
         if total > 0:
             self.progress_bar.setValue(int(current / total * 100))
         self.status_label.setText(message)
 
-    def _on_ocr_finished(self, results):
-        self.ocr_results = results
+    def _on_ocr_finished(self, results, retry_paths, cancelled):
+        is_retry = self._ocr_is_retry
+        if is_retry:
+            self.ocr_results.update(results)
+            self._update_retry_rows(results)
+        else:
+            self.ocr_results = results
         self.progress_bar.setValue(100)
         self.ocr_btn.setEnabled(True)
-        self.status_label.setText(f"识别完成，共 {len(results)} 条结果，正在识别城市...")
+        self.cancel_ocr_btn.setEnabled(False)
+        self._retry_paths = retry_paths
+        self.retry_ocr_btn.setEnabled(bool(retry_paths))
+
+        succeeded = len(results) - len(retry_paths)
+        summary = (
+            f"成功 {succeeded} 条，待重试 {len(retry_paths)} 条"
+            if retry_paths else f"成功 {succeeded} 条，未发现失败项"
+        )
+        if cancelled:
+            summary = "识别已取消，" + summary
+        self.status_label.setText(summary)
+
+        if is_retry:
+            self._refresh_review_state()
+            return
 
         self._populate_table()
 
@@ -1449,7 +1618,7 @@ class MainWindow(QWidget):
             sel_layout = QVBoxLayout(select_dialog)
 
             hint = QLabel(
-                f"请勾选属于「{city}」的店铺（剩余 {len(remaining)} 家待分配）："
+                f"请勾选属于「{city}」的店铺（剩余 {len(remaining)} 家待分配，默认未选择）："
             )
             hint.setStyleSheet("font-size: 13px; padding: 5px;")
             sel_layout.addWidget(hint)
@@ -1457,7 +1626,7 @@ class MainWindow(QWidget):
             list_widget = QListWidget()
             for shop in sorted(remaining):
                 item = QListWidgetItem(shop)
-                item.setCheckState(Qt.Checked)  # 默认全选
+                item.setCheckState(Qt.Unchecked)
                 list_widget.addItem(item)
             sel_layout.addWidget(list_widget)
 
@@ -1571,36 +1740,14 @@ class MainWindow(QWidget):
                     self.table.setItem(row_idx, col, item)
 
         self.table.resizeRowsToContents()
+        self._refresh_review_state()
 
     def _populate_table(self):
         self.table.setRowCount(0)
         for path, fields in self.ocr_results.items():
             row = self.table.rowCount()
             self.table.insertRow(row)
-
-            d = fields.to_dict()
-
-            # 判断品牌
-            brand_idx = detect_brand(d["product_name"])
-            brand_names = {0: "燕京", 1: "雪花", 2: "青岛", 3: "百威"}
-            brand_name = brand_names.get(brand_idx, "燕京")
-
-            values = [
-                d["branch_company"],
-                d["region"],
-                d["platform"],
-                d["shop_name"],
-                d["product_name"],
-                str(d["original_price"]) if d["original_price"] else "",
-                str(d["final_price"]) if d["final_price"] else "",
-                str(d["shop_discount"]) if d["shop_discount"] else "",
-                str(d["full_reduction"]) if d["full_reduction"] else "",
-                str(d["coupon"]) if d["coupon"] else "",
-                str(d["red_packet"]) if d["red_packet"] else "",
-                str(d["delivery_fee"]) if d["delivery_fee"] else "",
-                brand_name,
-                d["remark"],
-            ]
+            values = self._table_values_from_fields(fields)
 
             for col, val in enumerate(values):
                 item = QTableWidgetItem(val)
@@ -1622,6 +1769,108 @@ class MainWindow(QWidget):
             self.table.setItem(row, len(TABLE_COLUMNS), thumb_item)
 
         self.table.resizeRowsToContents()
+        self._refresh_review_state()
+
+    def _table_values_from_fields(self, fields):
+        """Convert OCR fields into the editable table's first fourteen values."""
+        data = fields.to_dict()
+        brand_idx = detect_brand(data["product_name"])
+        brand_names = {0: "燕京", 1: "雪花", 2: "青岛", 3: "百威"}
+        return [
+            data["branch_company"], data["region"], data["platform"],
+            data["shop_name"], data["product_name"],
+            str(data["original_price"]) if data["original_price"] else "",
+            str(data["final_price"]) if data["final_price"] else "",
+            str(data["shop_discount"]) if data["shop_discount"] else "",
+            str(data["full_reduction"]) if data["full_reduction"] else "",
+            str(data["coupon"]) if data["coupon"] else "",
+            str(data["red_packet"]) if data["red_packet"] else "",
+            str(data["delivery_fee"]) if data["delivery_fee"] else "",
+            brand_names.get(brand_idx, "燕京"), data["remark"],
+        ]
+
+    def _update_retry_rows(self, results):
+        """Replace OCR values only for retried image rows, preserving other edits."""
+        rows_by_path = {}
+        for row in range(self.table.rowCount()):
+            image_item = self.table.item(row, len(TABLE_COLUMNS))
+            if image_item:
+                rows_by_path[image_item.data(Qt.UserRole)] = row
+
+        for path, fields in results.items():
+            row = rows_by_path.get(path)
+            if row is None:
+                continue
+            for col, value in enumerate(self._table_values_from_fields(fields)):
+                item = self.table.item(row, col)
+                if item:
+                    item.setText(value)
+                else:
+                    self.table.setItem(row, col, QTableWidgetItem(value))
+        self.table.resizeRowsToContents()
+
+    def _on_table_item_changed(self, _item):
+        """Refresh review indicators after a user corrects a table cell."""
+        if not self._updating_review_state:
+            self._refresh_review_state()
+
+    def _get_row_review_issues(self, row):
+        """Build one review record from the current editable table row."""
+        def get_cell(col):
+            item = self.table.item(row, col)
+            return item.text().strip() if item else ""
+
+        return find_review_issues({
+            "region": get_cell(1),
+            "shop_name": get_cell(3),
+            "product_name": get_cell(4),
+            "original_price": get_cell(5),
+            "final_price": get_cell(6),
+            "remark": get_cell(13),
+        })
+
+    def _get_review_rows(self):
+        """Return table rows with their manual review reasons."""
+        review_rows = []
+        for row in range(self.table.rowCount()):
+            issues = self._get_row_review_issues(row)
+            if issues:
+                review_rows.append((row, issues))
+        return review_rows
+
+    def _refresh_review_state(self, _checked=None):
+        """Update row highlighting, filtering, and summary from table content."""
+        if self._updating_review_state:
+            return
+
+        self._updating_review_state = True
+        try:
+            review_rows = dict(self._get_review_rows())
+            total = self.table.rowCount()
+            pending = len(review_rows)
+            passed = total - pending
+            self.review_filter.setEnabled(total > 0)
+            if total == 0:
+                self.review_filter.setChecked(False)
+                self.review_summary_label.setText("尚未识别记录")
+                return
+
+            self.review_summary_label.setText(
+                f"共 {total} 条，待核对 {pending} 条，已通过 {passed} 条"
+            )
+            filter_enabled = self.review_filter.isChecked()
+            for row in range(total):
+                issues = review_rows.get(row, [])
+                self.table.setRowHidden(row, filter_enabled and not issues)
+                background = QColor("#FFF3CD") if issues else QColor("white")
+                tooltip = "待核对：" + "；".join(issues) if issues else "已通过基础核对"
+                for col in range(self.table.columnCount()):
+                    item = self.table.item(row, col)
+                    if item:
+                        item.setBackground(background)
+                        item.setToolTip(tooltip)
+        finally:
+            self._updating_review_state = False
 
     def _make_thumbnail(self, path, size=70):
         # 降采样解码：只解码缩略图所需的尺寸，避免全尺寸 1080x2400 解码
@@ -1812,6 +2061,26 @@ class MainWindow(QWidget):
         if not self.ocr_results:
             QMessageBox.warning(self, "提示", "没有可导出的数据，请先识别")
             return
+
+        review_rows = self._get_review_rows()
+        if review_rows:
+            examples = "\n".join(
+                f"第 {row + 1} 条：{'；'.join(issues)}"
+                for row, issues in review_rows[:3]
+            )
+            remaining = len(review_rows) - 3
+            if remaining > 0:
+                examples += f"\n另有 {remaining} 条待核对"
+            reply = QMessageBox.warning(
+                self,
+                "导出前核对",
+                f"当前有 {len(review_rows)} 条记录需要人工核对：\n\n{examples}"
+                "\n\n建议先修正后再导出。是否仍然导出？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
         # 从表格收集修正后的数据
         records = []

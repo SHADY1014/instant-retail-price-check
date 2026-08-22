@@ -226,7 +226,8 @@ def run_ocr(image_path):
         return _run_with_swift_fallback(image_path)
 
 
-def run_ocr_parallel(image_paths, progress_callback=None, max_workers=8):
+def run_ocr_parallel(image_paths, progress_callback=None, max_workers=8,
+                     should_cancel=None):
     """
     并行批量 OCR 识别（macOS Vision 内部按图像并行，实测 8 workers 吞吐最佳：
     0.35s/张(串行) -> 0.14s/张；16+ workers 无增益且推高系统负载）
@@ -235,29 +236,54 @@ def run_ocr_parallel(image_paths, progress_callback=None, max_workers=8):
         image_paths: 图片路径列表
         progress_callback: 回调函数 (done_count, total, image_path)
         max_workers: 线程数，默认 8
+        should_cancel: 无参回调；返回 True 时停止提交尚未开始的图片
 
     Returns:
         dict: {image_path: ocr_results}，OCR 失败的路径值为 {"error": ...}
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
     results = {}
     total = len(image_paths)
     if total == 0:
         return results
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(run_ocr, p): p for p in image_paths}
-        done = 0
-        for fut in as_completed(futures):
-            path = futures[fut]
-            done += 1
-            if progress_callback:
-                progress_callback(done, total, path)
-            try:
-                results[path] = fut.result()
-            except Exception as e:
-                results[path] = {"error": str(e)}
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    pending_paths = iter(image_paths)
+    futures = {}
+    done = 0
+
+    def submit_next():
+        if should_cancel and should_cancel():
+            return False
+        try:
+            path = next(pending_paths)
+        except StopIteration:
+            return False
+        futures[executor.submit(run_ocr, path)] = path
+        return True
+
+    try:
+        for _ in range(min(max_workers, total)):
+            if not submit_next():
+                break
+
+        while futures:
+            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in completed:
+                path = futures.pop(future)
+                done += 1
+                if progress_callback:
+                    progress_callback(done, total, path)
+                try:
+                    results[path] = future.result()
+                except Exception as e:
+                    results[path] = {"error": str(e)}
+                submit_next()
+    finally:
+        # 已开始的 Vision 调用不强杀，避免遗留 Swift 子进程；取消时只等待
+        # 当前少量任务返回，不会继续提交其余图片。
+        executor.shutdown(wait=True)
 
     return results
 

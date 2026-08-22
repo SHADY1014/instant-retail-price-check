@@ -5,8 +5,11 @@
 """
 
 import logging
+import json
 import sqlite3
 import threading
+import uuid
+from datetime import datetime
 
 from .schema import DB_PATH, init_db, get_meta, set_meta
 
@@ -562,6 +565,95 @@ def record_match(ocr_text, normalized_text, matched_shop_id, level, source_image
                 (ocr_text, normalized_text, matched_shop_id, level, source_image),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+
+# =========================================================
+# 联网城市识别审计
+# =========================================================
+
+def record_network_city_consent():
+    """Persist the time at which the user authorized name-only map searches."""
+    _ensure_init()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    set_meta("network_city_consent_at", timestamp)
+    return timestamp
+
+
+def create_network_city_request(authorized_at, allowed_cities, shop_names):
+    """Create an auditable, city-whitelisted map-search request."""
+    _ensure_init()
+    request_id = uuid.uuid4().hex
+    cities_json = json.dumps(sorted(set(allowed_cities)), ensure_ascii=False)
+    with _LOCK:
+        conn = _conn()
+        try:
+            conn.execute(
+                "INSERT INTO network_city_requests("
+                "request_id, authorized_at, allowed_cities, shop_count) "
+                "VALUES(?, ?, ?, ?)",
+                (request_id, authorized_at, cities_json, len(shop_names)),
+            )
+            conn.commit()
+            return request_id
+        finally:
+            conn.close()
+
+
+def record_network_city_candidates(request_id, candidates, source="baidu_map"):
+    """Record every requested shop and its returned candidate, including blanks."""
+    _ensure_init()
+    with _LOCK:
+        conn = _conn()
+        try:
+            conn.executemany(
+                "INSERT INTO network_city_candidates("
+                "request_id, shop_name, candidate_city, source) VALUES(?, ?, ?, ?)",
+                [(request_id, shop, city or "", source)
+                 for shop, city in candidates.items()],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def record_network_city_decisions(request_id, decisions):
+    """Record the operator-confirmed city (or explicit rejection) for candidates."""
+    _ensure_init()
+    with _LOCK:
+        conn = _conn()
+        try:
+            for shop_name, city in decisions.items():
+                conn.execute(
+                    "UPDATE network_city_candidates SET final_city = ?, "
+                    "decided_at = datetime('now','localtime') "
+                    "WHERE candidate_id = (SELECT candidate_id FROM "
+                    "network_city_candidates WHERE request_id = ? "
+                    "AND shop_name = ? ORDER BY candidate_id DESC LIMIT 1)",
+                    (city or "", request_id, shop_name),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_network_city_requests(limit=200):
+    """Return requests with candidate and confirmed city decisions for audit."""
+    _ensure_init()
+    with _LOCK:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT r.request_id, r.authorized_at, r.requested_at, "
+                "r.allowed_cities, r.shop_count, c.shop_name, "
+                "c.candidate_city, c.final_city, c.decided_at "
+                "FROM network_city_requests r JOIN network_city_candidates c "
+                "ON c.request_id = r.request_id "
+                "ORDER BY r.requested_at DESC, c.candidate_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
         finally:
             conn.close()
 

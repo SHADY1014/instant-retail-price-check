@@ -28,6 +28,9 @@ __all__ = [
     "get_stats", "get_conflicts", "get_city_matches",
     "list_shops", "list_aliases",
     "list_corrections", "list_batches",
+    "record_network_city_consent", "create_network_city_request",
+    "record_network_city_candidates", "record_network_city_decisions",
+    "list_network_city_requests",
 ]
 
 logger = logging.getLogger(__name__)
@@ -123,3 +126,25 @@ def list_corrections(limit=1000):
 
 def list_batches(limit=200):
     return repository.list_batches(limit)
+
+
+def record_network_city_consent():
+    return repository.record_network_city_consent()
+
+
+def create_network_city_request(authorized_at, allowed_cities, shop_names):
+    return repository.create_network_city_request(
+        authorized_at, allowed_cities, shop_names
+    )
+
+
+def record_network_city_candidates(request_id, candidates, source="baidu_map"):
+    return repository.record_network_city_candidates(request_id, candidates, source)
+
+
+def record_network_city_decisions(request_id, decisions):
+    return repository.record_network_city_decisions(request_id, decisions)
+
+
+def list_network_city_requests(limit=200):
+    return repository.list_network_city_requests(limit)

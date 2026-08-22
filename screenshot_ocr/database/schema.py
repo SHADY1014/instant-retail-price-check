@@ -12,6 +12,7 @@
   import_batches 投喂批次（file_hash 唯一 = 幂等键）
   match_history  匹配历史（L1-L7 分级记录）
   meta           版本/统计信息
+  network_city_requests / network_city_candidates  联网城市识别审计
 """
 
 import logging
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 _DATA_DIR = runtime_paths.data_dir()
 DB_PATH = runtime_paths.learning_db_path()
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS shops (
@@ -116,6 +117,27 @@ CREATE TABLE IF NOT EXISTS match_history (
 );
 CREATE INDEX IF NOT EXISTS idx_history_shop ON match_history(matched_shop_id);
 
+CREATE TABLE IF NOT EXISTS network_city_requests (
+    request_id       TEXT PRIMARY KEY,
+    authorized_at    TEXT NOT NULL,
+    requested_at     TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    allowed_cities   TEXT NOT NULL,
+    shop_count       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS network_city_candidates (
+    candidate_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id       TEXT NOT NULL REFERENCES network_city_requests(request_id),
+    shop_name        TEXT NOT NULL,
+    candidate_city   TEXT,
+    source           TEXT NOT NULL DEFAULT 'baidu_map',
+    final_city       TEXT,
+    decided_at       TEXT,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_network_candidates_request
+    ON network_city_candidates(request_id);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -141,7 +163,8 @@ def init_db():
     try:
         conn.executescript(_SCHEMA_SQL)
         conn.execute(
-            "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
+            "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (SCHEMA_VERSION,),
         )
         conn.commit()
