@@ -975,7 +975,23 @@ class MainWindow(QWidget):
         self.setStyleSheet(
             "QWidget { font-family: 'Microsoft YaHei UI', 'PingFang SC', "
             "'Heiti SC', 'Arial Unicode MS'; font-size: 13px; }"
-            "QPushButton, QToolButton { border-radius: 4px; padding: 0 12px; }"
+            "QPushButton, QToolButton { "
+            "background: #FFFFFF; color: #1F2933; border: 1px solid #B8C2CC; "
+            "border-radius: 4px; padding: 0 12px; }"
+            "QPushButton:hover, QToolButton:hover { background: #F3F6F8; }"
+            "QPushButton:disabled, QToolButton:disabled { "
+            "background: #F5F6F7; color: #AAB2BA; border-color: #DDE2E7; }"
+            "QPushButton#pasteAction { "
+            "background: #16A34A; color: white; border-color: #15803D; }"
+            "QPushButton#pasteAction:hover { background: #15803D; }"
+            "QPushButton#primaryAction { "
+            "font-weight: bold; background: #087CC1; color: white; "
+            "border-color: #0668A3; }"
+            "QPushButton#primaryAction:hover { background: #0668A3; }"
+            "QPushButton#exportAction { "
+            "font-weight: bold; background: #16803B; color: white; "
+            "border-color: #126B31; }"
+            "QPushButton#exportAction:hover { background: #126B31; }"
         )
 
         layout = QVBoxLayout(self)
@@ -997,7 +1013,7 @@ class MainWindow(QWidget):
         btn_layout.addWidget(self.zip_btn)
 
         self.paste_btn = QPushButton("📋 粘贴截图")
-        self.paste_btn.setStyleSheet("background: #27AE60; color: white;")
+        self.paste_btn.setObjectName("pasteAction")
         self.paste_btn.setToolTip("从剪贴板粘贴截图（Ctrl+V）")
         self.paste_btn.clicked.connect(self._paste_from_clipboard)
         btn_layout.addWidget(self.paste_btn)
@@ -1007,7 +1023,7 @@ class MainWindow(QWidget):
         btn_layout.addWidget(self.clear_btn)
 
         self.ocr_btn = QPushButton("🔍 开始 OCR 识别")
-        self.ocr_btn.setStyleSheet("font-weight: bold; background: #0070C0; color: white;")
+        self.ocr_btn.setObjectName("primaryAction")
         self.ocr_btn.clicked.connect(self._start_ocr)
         btn_layout.addWidget(self.ocr_btn)
 
@@ -1083,9 +1099,7 @@ class MainWindow(QWidget):
         export_layout.addWidget(export_label)
 
         self.export_btn = QPushButton("📋 导出 Excel")
-        self.export_btn.setStyleSheet(
-            "font-weight: bold; background: #008040; color: white;"
-        )
+        self.export_btn.setObjectName("exportAction")
         self.export_btn.clicked.connect(self._export_excel)
         export_layout.addWidget(self.export_btn)
 
