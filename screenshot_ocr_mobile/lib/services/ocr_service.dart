@@ -71,11 +71,13 @@ class OcrService {
   static Future<Map<String, List<OcrResult>>> runOcrBatch(
     List<String> imagePaths, {
     void Function(int current, int total, String? path)? progressCallback,
+    bool Function()? shouldCancel,
   }) async {
     final results = <String, List<OcrResult>>{};
     final total = imagePaths.length;
 
     for (var i = 0; i < imagePaths.length; i++) {
+      if (shouldCancel != null && shouldCancel()) break;
       if (progressCallback != null) {
         progressCallback(i, total, imagePaths[i]);
       }

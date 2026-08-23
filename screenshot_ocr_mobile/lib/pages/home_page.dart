@@ -10,6 +10,8 @@ import '../services/excel_exporter.dart';
 import '../services/field_parser.dart';
 import '../services/ocr_service.dart';
 import '../services/shop_city_db.dart';
+import '../services/review_rules.dart';
+import '../services/duplicate_checker.dart';
 import '../utils/constants.dart';
 
 class HomePage extends StatefulWidget {
@@ -24,6 +26,7 @@ class _HomePageState extends State<HomePage> {
 
   List<FormFields> _results = [];
   bool _isOcrRunning = false;
+  bool _cancelOcrRequested = false;
   String _status = '';
   int _ocrCurrent = 0;
   int _ocrTotal = 0;
@@ -33,6 +36,8 @@ class _HomePageState extends State<HomePage> {
   bool _useNetwork = false;
   // 仅显示未识别城市的记录
   bool _showUnmatchedOnly = false;
+  bool _showReviewOnly = false;
+  final Set<String> _failedImagePaths = {};
 
   @override
   void initState() {
@@ -46,12 +51,17 @@ class _HomePageState extends State<HomePage> {
 
   /// 当前显示的记录（按筛选条件）
   List<FormFields> get _visibleResults {
-    if (!_showUnmatchedOnly) return _results;
-    return _results.where((f) => f.region.isEmpty).toList();
+    return _results.where((f) {
+      if (_showUnmatchedOnly && f.region.isNotEmpty) return false;
+      if (_showReviewOnly && reviewIssues(f).isEmpty) return false;
+      return true;
+    }).toList();
   }
 
   /// 未识别城市的记录数
   int get _unmatchedCount => _results.where((f) => f.region.isEmpty).length;
+  int get _reviewCount =>
+      _results.where((f) => reviewIssues(f).isNotEmpty).length;
 
   // =========================================================
   // 导入图片（相册多选）
@@ -70,6 +80,12 @@ class _HomePageState extends State<HomePage> {
 
       if (!mounted) return;
       await _showCitySelectDialog();
+      setState(() {
+        _results = [];
+        _failedImagePaths.clear();
+        _showUnmatchedOnly = false;
+        _showReviewOnly = false;
+      });
       await _runOcr(tempDir);
     } catch (e) {
       _showSnack('导入图片失败: $e');
@@ -157,37 +173,72 @@ class _HomePageState extends State<HomePage> {
   // =========================================================
   // OCR 识别
   // =========================================================
-  Future<void> _runOcr(List<String> imagePaths) async {
+  Future<void> _runOcr(List<String> imagePaths, {bool retry = false}) async {
     setState(() {
       _isOcrRunning = true;
       _status = '开始识别...';
       _ocrCurrent = 0;
       _ocrTotal = imagePaths.length;
+      _cancelOcrRequested = false;
     });
 
     try {
       final results = <FormFields>[];
-      final ocrResults = await OcrService.runOcrBatch(
-        imagePaths,
-        progressCallback: (current, total, path) {
-          if (!mounted) return;
+      var nextIndex = 0;
+      for (var i = 0; i < imagePaths.length; i++) {
+        final path = imagePaths[i];
+        if (_cancelOcrRequested) {
+          nextIndex = i;
+          break;
+        }
+        nextIndex = i + 1;
+        if (mounted) {
           setState(() {
-            _ocrCurrent = current;
-            _ocrTotal = total;
-            _status = '识别中: ${current + 1}/$total';
+            _ocrCurrent = i;
+            _status = '识别中: ${i + 1}/${imagePaths.length}';
           });
-        },
-      );
-
-      for (final entry in ocrResults.entries) {
-        final fields = FieldParser.parse(entry.value);
-        fields.imagePath = entry.key;
-        results.add(fields);
+        }
+        try {
+          final ocrData = await OcrService.runOcr(path);
+          final fields = FieldParser.parse(ocrData);
+          fields.imagePath = path;
+          results.add(fields);
+          _failedImagePaths.remove(path);
+        } catch (e) {
+          final fields = FormFields(remark: 'OCR失败: $e', imagePath: path);
+          results.add(fields);
+          _failedImagePaths.add(path);
+        }
+      }
+      if (_cancelOcrRequested) {
+        for (var i = nextIndex; i < imagePaths.length; i++) {
+          final path = imagePaths[i];
+          results.add(FormFields(remark: 'OCR 未完成：已取消，可重试', imagePath: path));
+          _failedImagePaths.add(path);
+        }
       }
 
       if (!mounted) return;
-      setState(() => _results = results);
-      await _detectCities();
+      setState(() {
+        if (retry && results.isNotEmpty) {
+          final byPath = {for (final f in _results) f.imagePath: f};
+          for (final f in results) {
+            byPath[f.imagePath] = f;
+          }
+          _results = byPath.values.whereType<FormFields>().toList();
+        } else if (results.isNotEmpty) {
+          _results = results;
+        }
+        _ocrCurrent = imagePaths.length;
+        final failedInRun =
+            results.where((f) => reviewIssues(f).contains('OCR 识别失败')).length;
+        _status = _cancelOcrRequested
+            ? '识别已取消，可继续重试'
+            : '识别完成：成功 ${results.length - failedInRun} 条，失败 $failedInRun 条';
+      });
+      if (!retry && !_cancelOcrRequested && results.isNotEmpty) {
+        await _detectCities();
+      }
       if (mounted && _results.isEmpty) {
         setState(() => _status = '未识别到数据');
       }
@@ -203,6 +254,19 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  void _cancelOcr() {
+    if (!_isOcrRunning) return;
+    setState(() {
+      _cancelOcrRequested = true;
+      _status = '正在取消识别...';
+    });
+  }
+
+  Future<void> _retryFailedOcr() async {
+    if (_failedImagePaths.isEmpty || _isOcrRunning) return;
+    await _runOcr(_failedImagePaths.toList(), retry: true);
+  }
+
   // =========================================================
   // 导出 Excel
   // =========================================================
@@ -210,6 +274,31 @@ class _HomePageState extends State<HomePage> {
     if (_results.isEmpty) {
       _showSnack('没有可导出的数据');
       return;
+    }
+    final review = [
+      for (var i = 0; i < _results.length; i++)
+        if (reviewIssues(_results[i]).isNotEmpty)
+          (i, reviewIssues(_results[i])),
+    ];
+    if (review.isNotEmpty && mounted) {
+      final proceed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('导出前核对'),
+          content: Text('当前有 ${review.length} 条记录需要人工核对。\n'
+              '${review.take(3).map((e) => '第 ${e.$1 + 1} 条：${e.$2.join('；')}').join('\n')}\n\n'
+              '建议先修正后再导出，是否仍然导出？'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('返回核对')),
+            FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('仍然导出')),
+          ],
+        ),
+      );
+      if (proceed != true) return;
     }
     try {
       setState(() => _status = '导出中...');
@@ -224,6 +313,41 @@ class _HomePageState extends State<HomePage> {
       if (mounted) setState(() => _status = '导出失败，请重试');
       _showSnack('导出失败: $e');
     }
+  }
+
+  Future<void> _checkDuplicates() async {
+    final groups = findDuplicateGroups(_results);
+    if (groups.isEmpty) {
+      _showSnack('未发现重复商品');
+      return;
+    }
+    final remove = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('查重核查'),
+        content: Text(
+            '发现 ${groups.length} 组重复，共 ${groups.fold<int>(0, (n, g) => n + g.length - 1)} 条冗余记录。\n'
+            '口径：店铺名 + 平台 + 城市 + 理论成交价。\n\n确认删除每组中除第一条外的重复记录吗？'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('删除重复项')),
+        ],
+      ),
+    );
+    if (remove != true) return;
+    final deleteIndexes = groups.expand((g) => g.skip(1)).toSet().toList()
+      ..sort((a, b) => b.compareTo(a));
+    setState(() {
+      for (final i in deleteIndexes) {
+        _failedImagePaths.remove(_results[i].imagePath);
+        _results.removeAt(i);
+      }
+      _status = '已清理 ${deleteIndexes.length} 条重复记录';
+    });
   }
 
   void _showSnack(String msg) {
@@ -273,6 +397,28 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ],
                 ),
+                if (_isOcrRunning) ...[
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: _cancelOcr,
+                      icon: const Icon(Icons.stop_circle_outlined, size: 18),
+                      label: const Text('取消识别'),
+                    ),
+                  ),
+                ],
+                if (_failedImagePaths.isNotEmpty && !_isOcrRunning) ...[
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: _retryFailedOcr,
+                      icon: const Icon(Icons.refresh, size: 18),
+                      label: Text('重试失败项（${_failedImagePaths.length}）'),
+                    ),
+                  ),
+                ],
                 // 结果操作行：重新识别城市 + 未识别筛选
                 if (_results.isNotEmpty) ...[
                   const SizedBox(height: 8),
@@ -296,7 +442,23 @@ class _HomePageState extends State<HomePage> {
                         onSelected: (v) =>
                             setState(() => _showUnmatchedOnly = v),
                       ),
+                      const SizedBox(width: 6),
+                      FilterChip(
+                        label: Text('仅看待核对($_reviewCount)',
+                            style: const TextStyle(fontSize: 12)),
+                        selected: _showReviewOnly,
+                        onSelected: (v) => setState(() => _showReviewOnly = v),
+                      ),
                     ],
+                  ),
+                  const SizedBox(height: 6),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: _checkDuplicates,
+                      icon: const Icon(Icons.content_copy, size: 18),
+                      label: const Text('查重核查'),
+                    ),
                   ),
                 ],
                 // 限定城市显示
@@ -328,8 +490,10 @@ class _HomePageState extends State<HomePage> {
                     ? Center(
                         child: Text(
                           _showUnmatchedOnly
-                              ? '🎉 全部 $_unmatchedCount 条记录均已识别城市'
-                              : '无记录',
+                              ? '全部 $_unmatchedCount 条记录均已识别城市'
+                              : _showReviewOnly
+                                  ? '没有待核对记录'
+                                  : '无记录',
                           textAlign: TextAlign.center,
                           style: const TextStyle(color: Colors.grey),
                         ),
@@ -392,6 +556,11 @@ class _HomePageState extends State<HomePage> {
               '配送费¥${f.deliveryFee.toStringAsFixed(2)}',
               style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
+            if (reviewIssues(f).isNotEmpty)
+              Text(
+                '待核对：${reviewIssues(f).join('；')}',
+                style: const TextStyle(fontSize: 11, color: Colors.orange),
+              ),
           ],
         ),
         onTap: () => _editResult(f),

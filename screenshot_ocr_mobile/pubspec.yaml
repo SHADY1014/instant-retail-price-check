@@ -1,7 +1,7 @@
 name: price_check_ocr
 description: 美团截图OCR自动填表系统 - 移动端
 publish_to: 'none'
-version: 1.0.1+2
+version: 1.1.0+3
 
 environment:
   sdk: '>=3.0.0 <4.0.0'

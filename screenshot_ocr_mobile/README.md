@@ -6,6 +6,7 @@ Flutter 原生移动应用，提供 4 个核心功能：
 2. **数据库读取城市**：本地 SQLite（预置 619 条店铺-城市映射）
 3. **联网读取城市**：百度地图搜索（可选开启）
 4. **导出 Excel**：生成保留 M/N 公式和图片的巡查表 .xlsx 并可分享
+5. **核对与查重**：待核对筛选、失败图片重试、导出前提示、重复记录核查
 
 ## 目录结构
 
@@ -22,7 +23,9 @@ screenshot_ocr_mobile/
 │   │   ├── product_normalizer.dart  ← 产品名标准化（7品牌+规格）
 │   │   ├── city_detector.dart       ← 城市识别（L0库/L1店名/L3关键词/L2百度）
 │   │   ├── shop_city_db.dart        ← SQLite 数据库
-│   │   └── excel_exporter.dart      ← Excel 导出
+│   │   ├── excel_exporter.dart      ← Excel 导出
+│   │   ├── review_rules.dart        ← 待核对规则
+│   │   └── duplicate_checker.dart  ← 查重规则
 │   ├── pages/
 │   │   └── home_page.dart           ← 单页应用（导入/识别/列表/导出）
 │   └── utils/
@@ -84,8 +87,10 @@ flutter build apk --release
 |------|--------|--------|
 | OCR | RapidOCR (onnxruntime) | Google ML Kit |
 | Excel 图片 | WPS DISPIMG 嵌入 | 标准 OOXML 嵌入 + 原图副本 |
-| 汇总表/话术 | 有 | 暂未包含（可按需添加） |
-| 查重核查 | 有 | 暂未包含 |
+| 汇总表/话术 | 有 | 不接入移动端，保持轻量巡查流程 |
+| 查重核查 | 有 | 有（按店铺+平台+城市+理论成交价） |
+| OCR 失败重试 | 有 | 有（可取消、失败项单独重试） |
+| 待核对筛选/导出提示 | 有 | 有 |
 
 ## 权限说明
 

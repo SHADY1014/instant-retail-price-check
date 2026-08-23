@@ -129,7 +129,7 @@ def run_ocr(image_path):
     return output
 
 
-def run_ocr_batch(image_paths, progress_callback=None):
+def run_ocr_batch(image_paths, progress_callback=None, should_cancel=None):
     """
     批量 OCR 识别
 
@@ -147,6 +147,9 @@ def run_ocr_batch(image_paths, progress_callback=None):
     total = len(image_paths)
 
     for i, path in enumerate(image_paths):
+        if should_cancel and should_cancel():
+            logger.info("ocr_cancelled before index=%d total=%d", i + 1, total)
+            break
         logger.info("ocr_start index=%d total=%d image=%s", i + 1, total, path)
         if progress_callback:
             progress_callback(i, total, path)
@@ -165,7 +168,8 @@ def run_ocr_batch(image_paths, progress_callback=None):
     return results
 
 
-def run_ocr_parallel(image_paths, progress_callback=None, max_workers=8):
+def run_ocr_parallel(image_paths, progress_callback=None, max_workers=8,
+                     should_cancel=None):
     """
     并行批量 OCR（与 Mac 版接口一致）。
 
@@ -180,7 +184,7 @@ def run_ocr_parallel(image_paths, progress_callback=None, max_workers=8):
     Returns:
         dict: {image_path: ocr_results}，OCR 失败的路径值为 {"error": ...}
     """
-    return run_ocr_batch(image_paths, progress_callback)
+    return run_ocr_batch(image_paths, progress_callback, should_cancel)
 
 
 if __name__ == "__main__":
