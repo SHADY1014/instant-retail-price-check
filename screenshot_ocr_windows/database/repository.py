@@ -4,9 +4,12 @@
 短连接 + 全局锁（与 GUI 多线程兼容），每个方法独立事务。
 """
 
+import json
 import logging
 import sqlite3
 import threading
+import uuid
+from datetime import datetime
 
 from .schema import DB_PATH, init_db, get_meta, set_meta
 
@@ -106,7 +109,7 @@ def get_shop(shop_id):
 
 
 def get_shop_by_canonical(canonical_name):
-    """L1: canonical_name 精确匹配（包含迁移的历史本地库）。"""
+    """L1: canonical_name 精确匹配（含旧库记录但不自动采用其城市）。"""
     _ensure_init()
     with _LOCK:
         conn = _conn()
@@ -144,6 +147,53 @@ def list_shops(limit=1000, offset=0):
                 (limit, offset),
             ).fetchall()
             return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def list_invalid_imported_shops():
+    """List removable import or migration records that are not shop names."""
+    from .importer import is_invalid_shop_name
+
+    _ensure_init()
+    with _LOCK:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT s.* FROM shops s WHERE s.source IN ('import', 'migrate') OR EXISTS ("
+                "SELECT 1 FROM corrections c WHERE c.shop_id = s.shop_id "
+                "AND c.batch_id IS NOT NULL) ORDER BY s.shop_id"
+            ).fetchall()
+            return [dict(row) for row in rows
+                    if is_invalid_shop_name(row["canonical_name"])]
+        finally:
+            conn.close()
+
+
+def delete_invalid_imported_shops(shop_ids):
+    """Delete only user-reviewed invalid import or migration records."""
+    candidates = {
+        row["shop_id"]: row for row in list_invalid_imported_shops()
+    }
+    valid_ids = [shop_id for shop_id in shop_ids if shop_id in candidates]
+    if not valid_ids:
+        return []
+
+    placeholders = ", ".join("?" for _ in valid_ids)
+    _ensure_init()
+    with _LOCK:
+        conn = _conn()
+        try:
+            conn.execute(
+                f"DELETE FROM corrections WHERE shop_id IN ({placeholders})",
+                valid_ids)
+            conn.execute(
+                f"DELETE FROM shops WHERE shop_id IN ({placeholders})", valid_ids)
+            conn.commit()
+            return [candidates[shop_id]["canonical_name"] for shop_id in valid_ids]
+        except sqlite3.Error:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -357,9 +407,19 @@ def add_city_match(shop_id, city, province="", source="ocr", confidence=0.0):
                 conn.commit()
                 return row["match_id"], False
 
-            # 检查该店是否已有其他城市（确认过的）
+            # Only human sources are authoritative.  Migration data is a
+            # historical hint, and an explicit correction supersedes it.
+            if source in ("manual", "import"):
+                conn.execute(
+                    "UPDATE city_matches SET status = 'rejected', "
+                    "updated_at = datetime('now','localtime') "
+                    "WHERE shop_id = ? AND city != ? AND source = 'migrate' "
+                    "AND status != 'rejected'",
+                    (shop_id, city),
+                )
             others = conn.execute(
-                "SELECT match_id FROM city_matches WHERE shop_id = ? AND city != ? AND status = 'confirmed'",
+                "SELECT match_id FROM city_matches WHERE shop_id = ? AND city != ? "
+                "AND status = 'confirmed' AND source IN ('manual','import')",
                 (shop_id, city),
             ).fetchone()
             conflict = others is not None
@@ -562,6 +622,95 @@ def record_match(ocr_text, normalized_text, matched_shop_id, level, source_image
                 (ocr_text, normalized_text, matched_shop_id, level, source_image),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+
+# =========================================================
+# 联网城市识别审计
+# =========================================================
+
+def record_network_city_consent():
+    """Persist the time at which name-only map search was authorized."""
+    _ensure_init()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    set_meta("network_city_consent_at", timestamp)
+    return timestamp
+
+
+def create_network_city_request(authorized_at, allowed_cities, shop_names):
+    """Create an auditable request restricted to user-selected cities."""
+    _ensure_init()
+    request_id = uuid.uuid4().hex
+    cities_json = json.dumps(sorted(set(allowed_cities)), ensure_ascii=False)
+    with _LOCK:
+        conn = _conn()
+        try:
+            conn.execute(
+                "INSERT INTO network_city_requests("
+                "request_id, authorized_at, allowed_cities, shop_count) "
+                "VALUES(?, ?, ?, ?)",
+                (request_id, authorized_at, cities_json, len(shop_names)),
+            )
+            conn.commit()
+            return request_id
+        finally:
+            conn.close()
+
+
+def record_network_city_candidates(request_id, candidates, source="baidu_map"):
+    """Persist a top candidate, or an explicit no-result, for each shop."""
+    _ensure_init()
+    with _LOCK:
+        conn = _conn()
+        try:
+            conn.executemany(
+                "INSERT INTO network_city_candidates("
+                "request_id, shop_name, candidate_city, source) VALUES(?, ?, ?, ?)",
+                [(request_id, shop_name, city or "", source)
+                 for shop_name, city in candidates.items()],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def record_network_city_decisions(request_id, decisions):
+    """Persist each automatic or operator-confirmed final city decision."""
+    _ensure_init()
+    with _LOCK:
+        conn = _conn()
+        try:
+            for shop_name, city in decisions.items():
+                conn.execute(
+                    "UPDATE network_city_candidates SET final_city = ?, "
+                    "decided_at = datetime('now','localtime') "
+                    "WHERE candidate_id = (SELECT candidate_id FROM "
+                    "network_city_candidates WHERE request_id = ? "
+                    "AND shop_name = ? ORDER BY candidate_id DESC LIMIT 1)",
+                    (city or "", request_id, shop_name),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_network_city_requests(limit=200):
+    """Return network requests with candidate and final-city audit records."""
+    _ensure_init()
+    with _LOCK:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT r.request_id, r.authorized_at, r.requested_at, "
+                "r.allowed_cities, r.shop_count, c.shop_name, "
+                "c.candidate_city, c.final_city, c.decided_at "
+                "FROM network_city_requests r JOIN network_city_candidates c "
+                "ON c.request_id = r.request_id "
+                "ORDER BY r.requested_at DESC, c.candidate_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
         finally:
             conn.close()
 

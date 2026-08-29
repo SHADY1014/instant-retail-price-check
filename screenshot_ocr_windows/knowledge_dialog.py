@@ -69,6 +69,12 @@ class KnowledgeBaseDialog(QDialog):
         self.reapply_btn.clicked.connect(self._reapply)
         top.addWidget(self.reapply_btn)
 
+        self.clean_invalid_btn = QPushButton("清理异常投喂数据")
+        self.clean_invalid_btn.setToolTip(
+            "预览疑似规格、表头或数值被误导入或迁移为店铺的记录")
+        self.clean_invalid_btn.clicked.connect(self._clean_invalid_imports)
+        top.addWidget(self.clean_invalid_btn)
+
         top.addStretch()
         layout.addLayout(top)
 
@@ -231,10 +237,46 @@ class KnowledgeBaseDialog(QDialog):
                     f"     更新已有 {report['updated_shops']} ｜ 更新城市 {report['updated_cities']} ｜ "
                     f"冲突 {report['conflicts']} ｜ 忽略 {report['ignored_rows']}"
                 )
+                skipped = report.get("detail", {}).get("skipped_sheets", [])
+                if skipped:
+                    lines.append(f"     已跳过非巡查明细表：{'、'.join(skipped)}")
 
         lines += ["", f"汇总: 成功 {ok_cnt} ｜ 重复跳过 {dup_cnt} ｜ 失败 {fail_cnt}"]
         self._refresh_all()
         QMessageBox.information(self, "投喂完成", "\n".join(lines))
+
+    def _clean_invalid_imports(self):
+        """Preview then remove only invalid records selected by the user."""
+        try:
+            candidates = database.list_invalid_imported_shops()
+        except Exception as exc:
+            QMessageBox.critical(self, "读取失败", str(exc))
+            return
+
+        if not candidates:
+            QMessageBox.information(self, "无需清理", "未发现异常投喂数据。")
+            return
+
+        names = "\n".join(
+            f"- {row['canonical_name']}（ID {row['shop_id']}）"
+            for row in candidates)
+        answer = QMessageBox.question(
+            self, "确认清理异常投喂数据",
+            "以下记录疑似把规格、表头或数值误导入为店铺：\n\n"
+            f"{names}\n\n将同时删除这些记录的别名、城市匹配和投喂修正记录。是否继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        try:
+            deleted = database.delete_invalid_imported_shops(
+                [row["shop_id"] for row in candidates])
+        except Exception as exc:
+            QMessageBox.critical(self, "清理失败", str(exc))
+            return
+        self._refresh_all()
+        QMessageBox.information(self, "清理完成", f"已清理 {len(deleted)} 条异常投喂记录。")
 
     def _resolve_selected_conflict(self):
         row = self.tab_conflicts.currentRow()

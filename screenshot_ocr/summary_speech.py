@@ -17,7 +17,11 @@
 import re
 from collections import defaultdict, OrderedDict
 
-from summary_generator import _read_data_with_images, _short_name
+from summary_generator import (
+    _get_record_thresholds,
+    _read_data_with_images,
+    _short_name,
+)
 
 
 # =========================================================
@@ -93,7 +97,7 @@ def generate_speech(xlsx_path, provinces=None):
     说明：
         U8和1998不会同时查，话术根据实际数据自适应：
         - U8批次：合格线60元，第二档55元
-        - 1998批次：合格线70元，第二档74.99元
+        - 1998批次：广东合格线70元/第二档65元，广西合格线60元/第二档55元
     """
     records = _read_data_with_images(xlsx_path)
     if not records:
@@ -104,17 +108,6 @@ def generate_speech(xlsx_path, provinces=None):
         records = [r for r in records if r["province"] in provinces]
         if not records:
             return f"选中的省份 {provinces} 下没有匹配的记录。"
-
-    # 检测产品类型，确定阈值（U8和1998不会同时出现）
-    is_1998 = any("1998" in r["product_name"] for r in records)
-    if is_1998:
-        qual_threshold = 74.99    # 合格线（标准价格）
-        below_threshold = 70      # 第二档（宽松统计线）
-        below_label = "70元"
-    else:
-        qual_threshold = 60
-        below_threshold = 55
-        below_label = "55元"
 
     # 提取产品名（去重，保持顺序）
     product_names = list(OrderedDict.fromkeys(
@@ -168,8 +161,11 @@ def generate_speech(xlsx_path, provinces=None):
     for city in city_order:
         city_all = city_records[city]
         city_total = len(city_all)
-        # 不合格判定：按当前产品类型的合格线重新计算（不依赖r["passed"]）
-        city_failed = [r for r in city_all if r["theory_price"] < qual_threshold - 0.1]
+        # 不合格判定：按每条记录的省份合格线重新计算（不依赖旧缓存值）。
+        city_failed = [
+            r for r in city_all
+            if r["theory_price"] < _get_record_thresholds(r)[0] - 0.1
+        ]
         city_failed_count = len(city_failed)
 
         # 城市名去掉"市"后缀
@@ -183,7 +179,16 @@ def generate_speech(xlsx_path, provinces=None):
             )
             continue
 
-        city_below = sum(1 for r in city_failed if r["theory_price"] < below_threshold)
+        city_below_thresholds = sorted({
+            _get_record_thresholds(r)[1] for r in city_failed
+        })
+        city_below = sum(
+            1 for r in city_failed
+            if r["theory_price"] < _get_record_thresholds(r)[1]
+        )
+        below_label = "、".join(
+            f"{_format_price(value)}元" for value in city_below_thresholds
+        )
 
         # 按平台分组不合格店铺
         plat_groups = defaultdict(list)

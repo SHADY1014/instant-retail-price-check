@@ -181,7 +181,7 @@ class CityDetectWorker(QThread):
         super().__init__()
         self.ocr_results = ocr_results
         self.table = table
-        # 限定城市集合（如 {"广州市","佛山市"}），None 表示不限区域全量匹配
+        # 限定城市集合（如 {"广州市","佛山市"}），None 表示暂不进行自动匹配
         self.restrict_cities = restrict_cities
         # 在主线程中提前收集店铺名列表，避免在 QThread.run() 中跨线程访问 QTableWidget
         self._shop_names = set()
@@ -195,6 +195,13 @@ class CityDetectWorker(QThread):
         shop_names = self._shop_names
 
         if not shop_names:
+            self.finished_cities.emit({})
+            return
+
+        # None 表示用户没有选择城市范围。为避免同名店铺跨城市误命中，
+        # 自动匹配必须在明确范围内执行；取消选择时直接跳过。
+        if not self.restrict_cities:
+            logger.info("city_worker_skipped_without_scope shops=%d", len(shop_names))
             self.finished_cities.emit({})
             return
 
@@ -260,7 +267,7 @@ class ProvinceCitySelectDialog(QDialog):
         hint = QLabel(
             f"共识别到 {shop_count} 家店铺。\n"
             f"请勾选本批截图涉及的省份（可多选），再从城市列表中勾选对应城市。\n"
-            f"（取消则全量匹配）"
+            f"未选择城市时不会自动匹配，之后可使用外置按钮处理。"
         )
         hint.setStyleSheet("font-size: 13px; color: #333; padding: 10px;")
         hint.setWordWrap(True)
@@ -290,7 +297,7 @@ class ProvinceCitySelectDialog(QDialog):
         # 按钮
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.button(QDialogButtonBox.Ok).setText("确定")
-        btn_box.button(QDialogButtonBox.Cancel).setText("全量匹配")
+        btn_box.button(QDialogButtonBox.Cancel).setText("暂不设置城市")
         btn_box.accepted.connect(self._on_accept)
         btn_box.rejected.connect(self.reject)
         layout.addWidget(btn_box)
@@ -313,7 +320,7 @@ class ProvinceCitySelectDialog(QDialog):
     def _on_accept(self):
         selected = self._city_list.selectedItems()
         if not selected:
-            QMessageBox.warning(self, "提示", '请至少选择一个城市，或点击"全量匹配"')
+            QMessageBox.warning(self, "提示", '请至少选择一个城市，或点击"暂不设置城市"')
             return
         self._selected_cities = {it.text() for it in selected}
         self.accept()
@@ -748,7 +755,7 @@ class ProductSelectDialog(QDialog):
 
         info = QLabel(
             "燕京U8：合格线60元，第二档55元（云贵区域）\n"
-            "漓泉1998：合格线74.99元，第二档70元（广东区域）"
+            "漓泉1998：广东合格线70元、第二档65元；广西合格线60元、第二档55元"
         )
         info.setStyleSheet("font-size: 12px; color: #666; padding: 8px;")
         info.setWordWrap(True)
@@ -763,7 +770,7 @@ class ProductSelectDialog(QDialog):
         self._u8_btn.clicked.connect(lambda: self._select("u8"))
         layout.addWidget(self._u8_btn)
 
-        self._p1998_btn = QPushButton("漓泉1998（合格线74.99元）")
+        self._p1998_btn = QPushButton("漓泉1998（广东70元 / 广西60元）")
         self._p1998_btn.setStyleSheet(
             "font-size: 14px; font-weight: bold; background: #E65100; "
             "color: white; padding: 12px; border: none;"
@@ -1110,6 +1117,14 @@ class MainWindow(QWidget):
         self.net_city_btn.clicked.connect(self._network_detect_city)
         export_layout.addWidget(self.net_city_btn)
 
+        self.batch_city_btn = QPushButton("📍 一键设置城市")
+        self.batch_city_btn.setToolTip(
+            "为当前表格中未设置城市的店铺，按城市批量补充所属区域\n"
+            "人工确认的店铺城市会写入知识库，供后续识别使用"
+        )
+        self.batch_city_btn.clicked.connect(self._batch_set_shop_cities)
+        export_layout.addWidget(self.batch_city_btn)
+
         self.dedup_btn = QPushButton("🔍 查重核查")
         self.dedup_btn.setToolTip(
             "按店铺、平台、城市和理论成交价查找重复记录"
@@ -1141,8 +1156,8 @@ class MainWindow(QWidget):
         # 工具栏按钮统一高度；宽度随文字内容伸缩，避免窄屏时截断文字。
         for button in (
             self.add_btn, self.zip_btn, self.paste_btn, self.clear_btn,
-            self.ocr_btn, self.cancel_ocr_btn, self.retry_ocr_btn,
-            self.export_btn, self.net_city_btn, self.dedup_btn,
+        self.ocr_btn, self.cancel_ocr_btn, self.retry_ocr_btn,
+            self.export_btn, self.net_city_btn, self.batch_city_btn, self.dedup_btn,
             report_tools, data_tools,
         ):
             button.setFixedHeight(32)
@@ -1555,13 +1570,26 @@ class MainWindow(QWidget):
 
         # 先让用户选择省份+城市，限定数据库匹配范围（更精准，避免跨城误匹配）
         dialog = ProvinceCitySelectDialog(len(results), self)
-        restrict_cities = None
-        if dialog.exec_() == QDialog.Accepted:
-            restrict_cities = dialog.get_selected_cities()
-            self._last_province = dialog.get_selected_province()
-            self._last_cities = restrict_cities
-        else:
+        if dialog.exec_() != QDialog.Accepted:
+            # 取消是“暂不设置城市”，不能退化为不限范围匹配。
             self._last_cities = set()
+            self.status_label.setText(
+                f"识别完成，共 {len(results)} 条结果；城市暂未设置，"
+                f"可点击“一键设置城市”或“联网识别城市”继续处理"
+            )
+            return
+
+        restrict_cities = dialog.get_selected_cities()
+        if not restrict_cities:
+            self._last_cities = set()
+            self.status_label.setText(
+                f"识别完成，共 {len(results)} 条结果；城市暂未设置，"
+                f"可点击“一键设置城市”或“联网识别城市”继续处理"
+            )
+            return
+
+        self._last_province = dialog.get_selected_province()
+        self._last_cities = restrict_cities
 
         # 自动识别城市：在选定区域内查数据库，命中填入所属区域列
         # 在后台线程执行，避免卡UI
@@ -1577,7 +1605,7 @@ class MainWindow(QWidget):
     def _on_cities_detected(self, shop_to_city):
         """城市识别完成回调
 
-        数据库命中的直接填入，未命中的弹窗让用户选择批次城市。
+        数据库命中的直接填入；未命中店铺由用户按需一键批量设置城市。
         """
         detected = 0
         unmatched_shops = set()
@@ -1607,14 +1635,34 @@ class MainWindow(QWidget):
         # 按所属区域（城市）排序表格
         self._sort_table_by_region()
 
-        # 如果有未命中的店铺，弹窗让用户选择批次城市
+        # 不自动弹出城市分配，避免打断结果查看；由外置按钮按需发起。
         if unmatched_shops:
-            self._prompt_batch_city(unmatched_shops)
+            self.status_label.setText(
+                f"识别完成，共 {len(self.ocr_results)} 条结果，城市识别 {detected} 行；"
+                f"{len(unmatched_shops)} 家未识别，可点击“一键设置城市”处理"
+            )
         else:
             self.status_label.setText(
                 f"识别完成，共 {len(self.ocr_results)} 条结果，"
                 f"城市识别 {detected} 行，已按城市排序"
             )
+
+    def _batch_set_shop_cities(self):
+        """Open the manual city assignment workflow only when requested."""
+        unmatched_shops = set()
+        for row in range(self.table.rowCount()):
+            shop_item = self.table.item(row, 3)
+            region_item = self.table.item(row, 1)
+            shop_name = shop_item.text().strip() if shop_item else ""
+            region = region_item.text().strip() if region_item else ""
+            if shop_name and not region:
+                unmatched_shops.add(shop_name)
+
+        if not unmatched_shops:
+            QMessageBox.information(self, "提示", "当前表格中的店铺均已设置城市")
+            return
+
+        self._prompt_batch_city(unmatched_shops)
 
     def _prompt_batch_city(self, unmatched_shops):
         """弹窗让用户选择当前批次的城市，批量填入未识别的店铺
@@ -1732,7 +1780,7 @@ class MainWindow(QWidget):
         if all_updated and remaining:
             self.status_label.setText(
                 f"已设置 {all_updated} 行城市，剩余 {len(remaining)} 家未设置，"
-                f"可点击\"🌐 联网识别城市\"手动修正"
+                f"可点击“一键设置城市”或“联网识别城市”继续处理"
             )
         elif all_updated:
             city_str = "、".join(selected_cities)
@@ -1742,7 +1790,7 @@ class MainWindow(QWidget):
         else:
             self.status_label.setText(
                 f"识别完成，{len(unmatched_shops)} 家店铺未设置城市，"
-                f"可点击\"🌐 联网识别城市\"手动修正"
+                f"可点击“一键设置城市”或“联网识别城市”继续处理"
             )
 
     def _sort_table_by_region(self):

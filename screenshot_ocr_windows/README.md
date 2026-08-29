@@ -21,7 +21,7 @@
 ### 打包方法（开发者，在 Windows 机器上执行）
 
 ```bash
-1. 把本目录复制到 Windows 机器（含 模板.xlsx、data/shop_city.db）
+1. 把本目录复制到 Windows 机器（含 `模板.xlsx`、`data/shop_city.db` 历史迁移源）
 2. 双击 build_windows.bat
    - 自动安装 PyInstaller + 依赖
    - 自动执行 pyinstaller price_check_ocr.spec
@@ -30,9 +30,9 @@
 
 ### 打包原理
 
-- **内嵌资源**：`模板.xlsx`、初始 `data/shop_city.db`、RapidOCR 模型（PP-OCRv4，随 pip 包）、onnxruntime 动态库全部打入 EXE
+- **内嵌资源**：`模板.xlsx`、`data/shop_city.db` 历史迁移源、RapidOCR 模型（PP-OCRv4，随 pip 包）、onnxruntime 动态库全部打入 EXE
 - **运行时解压**：onefile 模式首次启动解压到 `%TEMP%`，由 `runtime_check.resource_path()` 定位资源
-- **可写数据**：店铺城市数据库首次启动从内嵌副本复制到 `%LOCALAPPDATA%\LQPriceCheck\data\shop_city.db`，之后读写该副本（EXE 内部目录只读）
+- **可写数据**：学习库保存在 `%LOCALAPPDATA%\LQPriceCheck\data\ocr_learning.db`；人工确认、人工投喂和联网识别审计均写入该库。旧 `shop_city.db` 只作一次性历史迁移参考，不会自动填入城市
 - **启动自检**（`runtime_check.py`）：Windows 10/11 64位 → 临时目录可写且 ≥1GB → 内嵌资源存在 → VC++ 2015-2022 x64 → OCR 动态库可导入
 
 ### 注意事项
@@ -80,7 +80,8 @@ screenshot_ocr_windows/
 ├── summary_speech.py    ← 总结话术生成器
 ├── city_detector.py     ← 城市自动识别
 ├── city_pool.py         ← 城市池（广东/广西/海南/贵州/云南）
-├── shop_city_db.py      ← 店铺城市数据库（SQLite）
+├── database/            ← 店铺/城市学习库、投喂与联网审计
+├── shop_city_db.py      ← 旧版店铺城市库兼容模块（仅供历史迁移）
 ├── download_models.py   ← OCR 引擎验证脚本
 ├── test_compare.py      ← 测试脚本
 ├── install.bat          ← 一键安装脚本（首次使用）
@@ -91,7 +92,7 @@ screenshot_ocr_windows/
 ├── README.md            ← 本文档
 ├── 模板.xlsx            ← Excel 模板
 ├── data/
-│   └── shop_city.db     ← 店铺城市历史标注数据库
+│   └── shop_city.db     ← 历史店铺城市迁移源（不直接自动匹配）
 └── models/              ← 预留目录（RapidOCR 模型随 pip 包自带）
 ```
 
@@ -128,9 +129,15 @@ python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(); print('OCR eng
 2. **选择省份+城市**：OCR 识别完成后弹出省份城市选择（支持多省多选）
 3. **核对修正**：在表格中检查识别结果；“仅看待核对”会筛出缺少区域、店铺、产品或关键价格的行
 4. **失败恢复**：识别过程中可取消；识别失败或取消的图片可点击“重试失败项”单独重跑
-5. **城市与重复核查**：按需使用联网识别城市、统一设置店铺城市和查重核查
+5. **城市与重复核查**：按需使用联网识别城市、统一设置店铺城市和查重核查；联网结果会保留分店名与 POI 匹配证据，歧义项默认不填入，待人工确认后才会写入知识库。联网仅发送店铺名称，并在本地记录授权、请求范围、候选和最终裁决
 6. **导出 Excel**：导出前会提示待核对条数，确认后生成巡查表
 7. **生成汇总表/话术**：选择巡查表 xlsx 生成价格合格率汇总报告或总结话术
+
+### 1998 价格标准
+
+1998 的 500ml*12 瓶/12 听规格按省份执行：广东第一档合格线 70 元、第二档 65 元；广西第一档合格线 60 元、第二档 55 元。9 装规格继续按 45 元执行。
+
+汇总表中的“合格率”按第一档合格线计算；“第二档合格率”按第二档线以上数量计算，低于第二档线的数量单独列示。混合广东、广西数据时，表头显示“各省标准”，每个省份行按本省阈值统计。
 
 ## OCR 引擎说明
 

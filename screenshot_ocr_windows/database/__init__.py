@@ -26,8 +26,11 @@ __all__ = [
     "learn_correction", "resolve_conflict",
     "import_excel", "migrate_shop_city_db",
     "get_stats", "get_conflicts", "get_city_matches",
-    "list_shops", "list_aliases",
-    "list_corrections", "list_batches",
+    "list_shops", "list_aliases", "list_invalid_imported_shops",
+    "delete_invalid_imported_shops", "list_corrections", "list_batches",
+    "record_network_city_consent", "create_network_city_request",
+    "record_network_city_candidates", "record_network_city_decisions",
+    "list_network_city_requests",
 ]
 
 logger = logging.getLogger(__name__)
@@ -92,8 +95,8 @@ def import_excel(excel_path, operator="gui"):
     return importer.import_excel(excel_path, operator)
 
 
-def migrate_shop_city_db():
-    return migrate.migrate_shop_city_db()
+def migrate_shop_city_db(old_db_path=None):
+    return migrate.migrate_shop_city_db(old_db_path)
 
 
 def get_stats():
@@ -117,9 +120,38 @@ def list_aliases(limit=2000):
     return repository.list_aliases(limit)
 
 
+def list_invalid_imported_shops():
+    return repository.list_invalid_imported_shops()
+
+
+def delete_invalid_imported_shops(shop_ids):
+    return repository.delete_invalid_imported_shops(shop_ids)
+
+
 def list_corrections(limit=1000):
     return repository.list_corrections(limit)
 
 
 def list_batches(limit=200):
     return repository.list_batches(limit)
+
+
+def record_network_city_consent():
+    return repository.record_network_city_consent()
+
+
+def create_network_city_request(authorized_at, allowed_cities, shop_names):
+    return repository.create_network_city_request(
+        authorized_at, allowed_cities, shop_names)
+
+
+def record_network_city_candidates(request_id, candidates, source="baidu_map"):
+    return repository.record_network_city_candidates(request_id, candidates, source)
+
+
+def record_network_city_decisions(request_id, decisions):
+    return repository.record_network_city_decisions(request_id, decisions)
+
+
+def list_network_city_requests(limit=200):
+    return repository.list_network_city_requests(limit)

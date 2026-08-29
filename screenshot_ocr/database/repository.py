@@ -109,7 +109,7 @@ def get_shop(shop_id):
 
 
 def get_shop_by_canonical(canonical_name):
-    """L1: canonical_name 精确匹配（包含迁移的历史本地库）。"""
+    """L1: canonical_name 精确匹配（含迁移的历史本地库，自动填城市）。"""
     _ensure_init()
     with _LOCK:
         conn = _conn()
@@ -401,9 +401,20 @@ def add_city_match(shop_id, city, province="", source="ocr", confidence=0.0):
                 conn.commit()
                 return row["match_id"], False
 
-            # 检查该店是否已有其他城市（确认过的）
+            # 检查该店是否已有其他城市（确认过的）。
+            # 冲突只发生在人工来源之间（manual/import）；
+            # 旧库迁移(migrate)数据不可信：人工投喂时直接降级，不触发冲突
+            if source in ("manual", "import"):
+                conn.execute(
+                    "UPDATE city_matches SET status = 'rejected', "
+                    "updated_at = datetime('now','localtime') "
+                    "WHERE shop_id = ? AND city != ? AND source = 'migrate' "
+                    "AND status != 'rejected'",
+                    (shop_id, city),
+                )
             others = conn.execute(
-                "SELECT match_id FROM city_matches WHERE shop_id = ? AND city != ? AND status = 'confirmed'",
+                "SELECT match_id FROM city_matches WHERE shop_id = ? AND city != ? "
+                "AND status = 'confirmed' AND source IN ('manual','import')",
                 (shop_id, city),
             ).fetchone()
             conflict = others is not None

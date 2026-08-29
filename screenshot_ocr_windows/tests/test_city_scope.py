@@ -16,25 +16,32 @@ import city_detector
 
 
 class CityScopeTests(unittest.TestCase):
-    def test_legacy_local_match_is_used_when_learning_db_misses(self):
-        with patch.object(city_detector, "_batch_lookup_learned", return_value={}), \
-             patch("shop_city_db.batch_lookup", return_value={"东莞店": "东莞市"}):
+    def test_legacy_local_match_is_not_automatically_used(self):
+        with patch.object(city_detector, "_batch_lookup_learned", return_value={}):
             matched = city_detector.batch_lookup_local_cities(["东莞店"], {"东莞市"})
-        self.assertEqual(matched, {"东莞店": "东莞市"})
+        self.assertEqual(matched, {})
 
-    def test_legacy_result_outside_selected_city_is_rejected(self):
-        with patch.object(city_detector, "_batch_lookup_learned", return_value={}), \
-             patch("shop_city_db.batch_lookup", return_value={"佛山店": "佛山市"}):
-            matched = city_detector.batch_lookup_local_cities(["佛山店"], {"东莞市"})
+    def test_learned_result_outside_selected_city_is_rejected(self):
+        with patch.object(
+                city_detector, "_batch_lookup_learned",
+                return_value={"佛山店": "佛山市"}):
+            matched = city_detector.batch_lookup_local_cities(
+                ["佛山店"], {"东莞市"})
         self.assertEqual(matched, {})
 
     def test_region_lookup_rejects_out_of_range_network_result(self):
-        with patch.object(city_detector, "_search_baidu_map", return_value={"佛山市"}):
+        candidates = [
+            city_detector.PoiCandidate(
+                city="佛山市", poi_name="测试店", rank=0, query="测试店",
+            ),
+        ]
+        with patch.object(
+                city_detector, "_search_baidu_candidates", return_value=candidates):
             city = city_detector.detect_city_in_region("测试店", {"东莞市"})
         self.assertEqual(city, "")
 
     def test_empty_selected_city_set_never_expands_to_all_cities(self):
-        with patch.object(city_detector, "_search_baidu_map") as search:
+        with patch.object(city_detector, "_search_baidu_candidates") as search:
             city = city_detector.detect_city_in_region("东莞店", set())
         self.assertEqual(city, "")
         search.assert_not_called()

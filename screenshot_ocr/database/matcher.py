@@ -191,16 +191,13 @@ def _build_result(level, shop, raw, normalized, record_history, source_image):
 
 
 def _shop_city(shop_id):
-    """取店铺主城市。
-
-    ``migrate`` 是用户旧版本地库的迁移来源。它仅会经 L1-L4 精确匹配
-    自动填入；L5 模糊候选仍必须人工确认。
-    """
+    """取店铺主城市。只信人工投喂来源（manual/import），
+    旧库迁移等自动来源不参与城市标注（城市标注只能来自人工审核）。"""
     matches = repository.get_city_matches(shop_id)
     if not matches:
         return "", "", False
     confirmed = [m for m in matches
-                 if m["status"] == "confirmed" and m["source"] in ("manual", "import", "migrate")]
+                 if m["status"] == "confirmed" and m["source"] in ("manual", "import")]
     if len(confirmed) > 1:
         return confirmed[0]["city"], confirmed[0].get("province", ""), True
     if confirmed:

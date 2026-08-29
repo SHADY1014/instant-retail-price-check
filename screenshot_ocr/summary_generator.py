@@ -20,7 +20,7 @@ from copy import copy
 from datetime import datetime
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles import Alignment, Border, Color, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
 
@@ -38,6 +38,13 @@ QUALIFICATION_RULES = [
 
 # 1998 产品的所有名称变体（OCR统一为"漓泉1998啤酒"，人工可能改为"铂金1998啤酒"/"特渠1998啤酒"）
 _1998_KEYWORDS = ("漓泉1998", "铂金1998", "特渠1998")
+_1998_12_SPECS = {"500ml*12瓶", "500ml*12听"}
+# 1998 12瓶/12听按销售省份执行不同价格口径。
+# 未配置省份暂保留旧口径，避免对历史数据做无依据的推断。
+_1998_PROVINCE_THRESHOLDS = {
+    "广东": (70, 65),
+    "广西": (60, 55),
+}
 
 
 def _is_1998_product(product_name):
@@ -75,9 +82,9 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 # =========================================================
 FONT_NAME = "微软雅黑"
 
-# 标题行（深蓝底白字，与模板 A1 一致）
+# 标题行（深蓝底主题浅色 1 字，与模板 A1 一致）
 STYLE_TITLE = {
-    "font": Font(name=FONT_NAME, size=14, bold=True, color="FFFFFFFF"),
+    "font": Font(name=FONT_NAME, size=14, bold=True, color=Color(theme=0)),
     "fill": PatternFill(fill_type="solid", fgColor="FF003366"),
     "align": Alignment(horizontal="center", vertical="center"),
 }
@@ -86,14 +93,14 @@ STYLE_TITLE = {
 STYLE_SUBTITLE = {
     "font": Font(name=FONT_NAME, size=9, bold=False, color="FF666666"),
     "fill": PatternFill(fill_type=None),
-    "align": Alignment(horizontal="center", vertical="center"),
+    "align": Alignment(horizontal="center", vertical="center", wrap_text=True),
 }
 
-# 表头行（蓝底白字，与模板第2行一致）
+# 表头行（蓝底主题浅色 1 字，与模板第2行一致）
 STYLE_HEADER = {
-    "font": Font(name=FONT_NAME, size=11, bold=True, color="FFFFFFFF"),
+    "font": Font(name=FONT_NAME, size=11, bold=True, color=Color(theme=0)),
     "fill": PatternFill(fill_type="solid", fgColor="FF0070C0"),
-    "align": Alignment(horizontal="center", vertical="center"),
+    "align": Alignment(horizontal="center", vertical="center", wrap_text=True),
 }
 
 # 数据行
@@ -194,10 +201,10 @@ def _safe_float(val):
         return 0.0
 
 
-def _get_qualification_line(product_name, spec):
-    """根据产品名和规格获取合格线
+def _get_base_qualification_line(product_name, spec):
+    """根据产品名和规格获取省份覆盖前的基础合格线。
 
-    兼容1998系列的三种命名：漓泉1998/铂金1998/特渠1998，统一按漓泉1998规则判定。
+    兼容 1998 系列的三种命名：漓泉1998/铂金1998/特渠1998，统一按漓泉1998规则判定。
     """
     # 1998 系列：铂金1998/特渠1998 视同 漓泉1998
     normalized = product_name
@@ -211,11 +218,50 @@ def _get_qualification_line(product_name, spec):
     return None
 
 
-def _get_secondary_threshold(product_name):
-    """第二档阈值：U8为55元（低于60的宽松统计线），1998为70元（低于74.99的宽松统计线）"""
+def _get_qualification_line(product_name, spec, province=""):
+    """根据产品、规格和省份获取合格线。"""
+    base_line = _get_base_qualification_line(product_name, spec)
+    if base_line is None:
+        return None
+    if _is_1998_product(product_name) and spec in _1998_12_SPECS:
+        return _1998_PROVINCE_THRESHOLDS.get(province, (base_line, 70))[0]
+    return base_line
+
+
+def _get_secondary_threshold(product_name, province="", spec=""):
+    """获取第二档线：1998按省份，U8为55元。"""
     if _is_1998_product(product_name):
+        if spec in _1998_12_SPECS:
+            base_line = _get_base_qualification_line(product_name, spec)
+            return _1998_PROVINCE_THRESHOLDS.get(province, (base_line, 70))[1]
         return 70
     return 55
+
+
+def _get_record_thresholds(record):
+    """Return ``(qualification_line, secondary_line)`` for one report row."""
+    product_name = str(record.get("product_name", ""))
+    spec = str(record.get("spec", ""))
+    province = str(record.get("province", ""))
+    primary = _get_qualification_line(product_name, spec, province)
+    if primary is None:
+        primary = record.get("qual_line")
+    secondary = _get_secondary_threshold(product_name, province, spec)
+    if not _is_1998_product(product_name) and not product_name:
+        secondary = record.get("secondary_line", secondary)
+    return primary, secondary
+
+
+def _threshold_header_label(records, index):
+    """Format a header label while making mixed-province rules explicit."""
+    values = set()
+    for record in records:
+        threshold = _get_record_thresholds(record)[index]
+        if threshold is not None:
+            values.add(_format_threshold(threshold))
+    if len(values) == 1:
+        return f"{next(iter(values))}元"
+    return "各省标准"
 
 
 def _format_threshold(val):
@@ -250,6 +296,10 @@ def _get_province(region):
     """从区域名（如'南宁市'）反查省份"""
     if not region:
         return ""
+    # 兼容人工填写的“广东省/广西省”或“广东-广州”等省份前缀。
+    for province in _1998_PROVINCE_THRESHOLDS:
+        if province in region:
+            return province
     if region in CITY_TO_PROVINCE:
         return CITY_TO_PROVINCE[region]
     for city, prov in CITY_TO_PROVINCE.items():
@@ -335,9 +385,6 @@ def _read_data_with_images(xlsx_path):
                 continue
 
             spec = _extract_spec(str(product_name))
-            qual_line = _get_qualification_line(str(product_name), spec)
-            if qual_line is None:
-                continue
 
             try:
                 fp = float(final_price)
@@ -350,6 +397,11 @@ def _read_data_with_images(xlsx_path):
                 orig = 0
 
             province = _get_province(str(region) if region else "")
+            qual_line = _get_qualification_line(str(product_name), spec, province)
+            if qual_line is None:
+                continue
+            secondary_line = _get_secondary_threshold(
+                str(product_name), province, spec)
 
             # 提取图片
             # O 列是 DISPIMG 公式，data_only=True 时可能读到 None（缓存值为空）
@@ -413,6 +465,7 @@ def _read_data_with_images(xlsx_path):
                 "final_price": fp,
                 "theory_price": tp,
                 "qual_line": qual_line,
+                "secondary_line": secondary_line,
                 "passed": passed,
                 "image_bytes": img_bytes,
                 "all_columns": all_columns,
@@ -440,13 +493,9 @@ def _build_province_summary(ws, records, start_row=1):
     active_rules = _get_active_rules(records)
     if not active_rules:
         return start_row
-    # 取第一条规则的合格线作为表头显示（同一批次只有一个产品）
-    primary_line = active_rules[0][2]
-    primary_label = f"{int(primary_line)}元" if primary_line == int(primary_line) else f"{primary_line}元"
-    # 第二档阈值（根据产品名判断）
-    sample_product = active_rules[0][0]
-    secondary_threshold = _get_secondary_threshold(sample_product)
-    secondary_label = _format_threshold(secondary_threshold)
+    # 混合省份时表头使用“各省标准”，具体阈值写在每个省份行和标准说明中。
+    primary_label = _threshold_header_label(records, 0)
+    secondary_label = _threshold_header_label(records, 1)
 
     # 标题
     ws.merge_cells(start_row=start_row, start_column=1,
@@ -456,17 +505,21 @@ def _build_province_summary(ws, records, start_row=1):
 
     # 合格标准行（只显示实际出现的产品规格，产品名取自实际数据以兼容铂金/特渠命名）
     # 同一规格可能有多个产品名变体（铂金1998/特渠1998/漓泉1998），合并显示
-    seen_name_spec = []  # [(product_name, spec, line)]
+    seen_name_spec = []  # [(province, product_name, spec, primary, secondary)]
     name_spec_set = set()
     for r in records:
         nm = _short_name(r["product_name"])
         sp = r["spec"]
-        ln = r["qual_line"]
-        key = (nm, sp, ln)
+        primary, secondary = _get_record_thresholds(r)
+        key = (r.get("province", ""), nm, sp, primary, secondary)
         if key not in name_spec_set:
             name_spec_set.add(key)
             seen_name_spec.append(key)
-    std_parts = [f"{nm}（{sp.replace('500ml*', '')}）≥{ln}元" for nm, sp, ln in seen_name_spec]
+    std_parts = [
+        f"{province or '未识别省份'}{nm}（{sp.replace('500ml*', '')}）≥{primary}元；"
+        f"{secondary}元以上计入第二档"
+        for province, nm, sp, primary, secondary in seen_name_spec
+    ]
     std_text = "合格标准：  " + "  |  ".join(std_parts) + "\n理论成交价总部定义：产品理论成交价格=产品成交价格-打包、配送费"
     ws.merge_cells(start_row=start_row + 1, start_column=1,
                    end_row=start_row + 1, end_column=14)
@@ -475,12 +528,12 @@ def _build_province_summary(ws, records, start_row=1):
 
     # 表头（动态显示合格线和第二档阈值）
     header_row = start_row + 2
-    headers = ["省份", "产品名称", "规格", "合格线(元)", "总数",
-               f"合格数（{primary_label}以上）",
-               "不合格数", f"合格率（{primary_label}以上售价）",
-               f"{secondary_label}元以上价格", f"{secondary_label}元以下价格",
-               f"合格率（{secondary_label}元以上售价）",
-               "最低理论成交价", "最高理论成交价", "平均理论成交价"]
+    headers = ["省份", "产品名称", "规格", "合格线\n(元)", "总数",
+               f"合格数\n（{primary_label}以上）",
+               "不合格数", f"合格率\n（{primary_label}以上售价）",
+               f"{secondary_label}以上\n价格", f"{secondary_label}以下\n价格",
+               f"合格率\n（{secondary_label}以上售价）",
+               "最低理论\n成交价", "最高理论\n成交价", "平均理论\n成交价"]
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=header_row, column=col, value=h)
         _apply_style(cell, STYLE_HEADER)
@@ -502,20 +555,27 @@ def _build_province_summary(ws, records, start_row=1):
 
     for (province, full_name, spec), items in sorted(groups.items()):
         count = len(items)
-        passed = sum(1 for r in items if r["passed"])
+        primary_line, secondary_threshold = _get_record_thresholds(items[0])
+        passed = sum(
+            1 for r in items
+            if r["theory_price"] >= _get_record_thresholds(r)[0] - 0.1
+        )
         failed = count - passed
         prices = [r["theory_price"] for r in items]
         avg_price = round(sum(prices) / len(prices), 1) if prices else 0
 
-        # 第二档阈值分组统计（U8用55，1998用74.99）
-        above_items = [r for r in items if r["theory_price"] >= secondary_threshold]
+        # 第二档阈值按省份执行（1998 广东65/广西55；U8为55）。
+        above_items = [
+            r for r in items
+            if r["theory_price"] >= _get_record_thresholds(r)[1]
+        ]
         below_items = [r for r in items if r["theory_price"] < secondary_threshold]
         above_count = len(above_items)
         below_count = len(below_items)
 
         # 合格率/第二档合格率改用 Excel 公式：F/E、I/E
         # （第二档合格率 = 第二档以上数量 / 总数，与用户修改的表一致）
-        values = [province, _short_name(full_name), spec, items[0]["qual_line"],
+        values = [province, _short_name(full_name), spec, primary_line,
                   count, passed, failed,
                   f"=F{row_idx}/E{row_idx}",
                   above_count, below_count,
@@ -565,8 +625,9 @@ def _build_province_summary(ws, records, start_row=1):
 
     # 行高
     ws.row_dimensions[start_row].height = 30
-    ws.row_dimensions[start_row + 1].height = 20
-    for r in range(header_row, row_idx + 1):
+    ws.row_dimensions[start_row + 1].height = 34
+    ws.row_dimensions[header_row].height = 42
+    for r in range(header_row + 1, row_idx + 1):
         ws.row_dimensions[r].height = 22
 
     return row_idx + 1  # 留1行空隙
@@ -587,11 +648,8 @@ def _build_city_summary(ws, records, start_row=1):
     active_rules = _get_active_rules(records)
     if not active_rules:
         return start_row
-    primary_line = active_rules[0][2]
-    primary_label = f"{int(primary_line)}元" if primary_line == int(primary_line) else f"{primary_line}元"
-    sample_product = active_rules[0][0]
-    secondary_threshold = _get_secondary_threshold(sample_product)
-    secondary_label = _format_threshold(secondary_threshold)
+    primary_label = _threshold_header_label(records, 0)
+    secondary_label = _threshold_header_label(records, 1)
 
     # 标题
     ws.merge_cells(start_row=start_row, start_column=1,
@@ -605,26 +663,30 @@ def _build_city_summary(ws, records, start_row=1):
     for r in records:
         nm = _short_name(r["product_name"])
         sp = r["spec"]
-        ln = r["qual_line"]
-        key = (nm, sp, ln)
+        primary, secondary = _get_record_thresholds(r)
+        key = (r.get("province", ""), nm, sp, primary, secondary)
         if key not in name_spec_set:
             name_spec_set.add(key)
             seen_name_spec.append(key)
-    std_parts = [f"{nm}（{sp.replace('500ml*', '')}）≥{ln}元" for nm, sp, ln in seen_name_spec]
+    std_parts = [
+        f"{province or '未识别省份'}{nm}（{sp.replace('500ml*', '')}）≥{primary}元；"
+        f"{secondary}元以上计入第二档"
+        for province, nm, sp, primary, secondary in seen_name_spec
+    ]
     std_text = "合格标准：" + "  |  ".join(std_parts) + "\n理论成交价总部定义：产品理论成交价格=产品成交价格-打包、配送费"
     ws.merge_cells(start_row=start_row + 1, start_column=1,
-                   end_row=start_row + 1, end_column=14)
+                   end_row=start_row + 1, end_column=15)
     ws.cell(row=start_row + 1, column=1, value=std_text)
     _apply_style(ws.cell(row=start_row + 1, column=1), STYLE_SUBTITLE)
 
     # 表头（动态显示合格线和第二档阈值）
     header_row = start_row + 2
-    headers = ["省份", "地级市", "产品名称", "规格", "合格线(元)", "总数",
-               f"合格数（{primary_label}以上）",
-               "不合格数", f"合格率（{primary_label}以上售价）",
-               f"{secondary_label}元以上价格", f"{secondary_label}元以下价格",
-               f"合格率（{secondary_label}元以上售价）",
-               "最低理论成交价", "最高理论成交价", "平均理论成交价"]
+    headers = ["省份", "地级市", "产品名称", "规格", "合格线\n(元)", "总数",
+               f"合格数\n（{primary_label}以上）",
+               "不合格数", f"合格率\n（{primary_label}以上售价）",
+               f"{secondary_label}以上\n价格", f"{secondary_label}以下\n价格",
+               f"合格率\n（{secondary_label}以上售价）",
+               "最低理论\n成交价", "最高理论\n成交价", "平均理论\n成交价"]
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=header_row, column=col, value=h)
         _apply_style(cell, STYLE_HEADER)
@@ -638,20 +700,27 @@ def _build_city_summary(ws, records, start_row=1):
     row_idx = header_row + 1
     for (province, region, full_name, spec), items in sorted(groups.items()):
         count = len(items)
-        passed = sum(1 for r in items if r["passed"])
+        primary_line, secondary_threshold = _get_record_thresholds(items[0])
+        passed = sum(
+            1 for r in items
+            if r["theory_price"] >= _get_record_thresholds(r)[0] - 0.1
+        )
         failed = count - passed
         prices = [r["theory_price"] for r in items]
         avg_price = round(sum(prices) / len(prices), 1) if prices else 0
 
-        # 第二档阈值分组统计（U8用55，1998用74.99）
-        above_items = [r for r in items if r["theory_price"] >= secondary_threshold]
+        # 第二档阈值按省份执行（1998 广东65/广西55；U8为55）。
+        above_items = [
+            r for r in items
+            if r["theory_price"] >= _get_record_thresholds(r)[1]
+        ]
         below_items = [r for r in items if r["theory_price"] < secondary_threshold]
         above_count = len(above_items)
         below_count = len(below_items)
 
         # 合格率/第二档合格率改用 Excel 公式：G/F、J/F
         # （第二档合格率 = 第二档以上数量 / 总数，与用户修改的表一致）
-        values = [province, region, _short_name(full_name), spec, items[0]["qual_line"],
+        values = [province, region, _short_name(full_name), spec, primary_line,
                   count, passed, failed,
                   f"=G{row_idx}/F{row_idx}",
                   above_count, below_count,
@@ -674,8 +743,9 @@ def _build_city_summary(ws, records, start_row=1):
 
     # 行高
     ws.row_dimensions[start_row].height = 30
-    ws.row_dimensions[start_row + 1].height = 20
-    for r in range(header_row, row_idx):
+    ws.row_dimensions[start_row + 1].height = 34
+    ws.row_dimensions[header_row].height = 42
+    for r in range(header_row + 1, row_idx):
         ws.row_dimensions[r].height = 22
 
     return row_idx + 1  # 留1行空隙
@@ -700,7 +770,7 @@ def _build_detail_sheet(ws, records, start_row=1):
                    end_row=start_row, end_column=16)
     title_cell = ws.cell(row=start_row, column=1,
                          value="燕京啤酒全国即时零售渠道产品价格巡查表")
-    title_cell.font = Font(name=FONT_NAME, size=14, bold=True, color="FFFFFFFF")
+    title_cell.font = Font(name=FONT_NAME, size=14, bold=True, color=Color(theme=0))
     title_cell.fill = PatternFill(fill_type="solid", fgColor="FF003366")
     title_cell.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[start_row].height = 38
@@ -718,7 +788,7 @@ def _build_detail_sheet(ws, records, start_row=1):
     ]
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=header_row, column=col, value=h)
-        cell.font = Font(name=FONT_NAME, size=11, bold=True, color="FFFFFFFF")
+        cell.font = Font(name=FONT_NAME, size=11, bold=True, color=Color(theme=0))
         cell.fill = PatternFill(fill_type="solid", fgColor="FF0070C0")
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = copy(_THIN_BORDER)
