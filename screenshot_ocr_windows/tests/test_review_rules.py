@@ -28,3 +28,9 @@ class ReviewRuleTests(unittest.TestCase):
 
     def test_failed_ocr_is_retryable_review(self):
         self.assertEqual(find_review_issues({"remark": "OCR失败: model"}), ["OCR 识别失败"])
+
+    def test_cancelled_ocr_is_retryable_review(self):
+        self.assertEqual(
+            find_review_issues({"remark": "OCR 未完成：已取消，可重试"}),
+            ["OCR 识别失败"],
+        )

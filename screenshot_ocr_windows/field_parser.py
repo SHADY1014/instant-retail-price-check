@@ -2,11 +2,11 @@
 OCR 文本 → 表单字段解析器
 
 将 macOS Vision OCR 识别出的文本列表解析为 Excel 表单字段。
-基于美团闪购结算页截图的布局规律：
+基于美团/淘宝/京东即时零售结算页截图的布局规律：
   - 店铺名称在 "选择收货地址" 下方
   - 商品名称在商品列表区域
-  - 各种价格在结算明细区域（商品总价/打包费/配送费/商家活动/红包等）
-  - 最终成交价在底部
+  - 各种价格在结算明细区域（商品总价/商品金额/打包费/配送费/运费等）
+  - 最终成交价在底部（京东为“应付总额”）
 """
 
 import re
@@ -21,7 +21,7 @@ class FormFields:
     branch_company: str = "漓泉销售公司"
     # B: 所属主要区域 — "XX市"
     region: str = ""
-    # C: 区域内即时零售平台 — 美团截图固定为"美团闪购"
+    # C: 区域内即时零售平台 — 统一使用内部平台名称
     platform: str = "美团闪购"
     # D: 店铺名称
     shop_name: str = ""
@@ -46,6 +46,9 @@ class FormFields:
     # O: 图片（由 excel_writer 插入）
     # P: 备注
     remark: str = ""
+    # 内部信号：产品规格无法从截图可靠识别（如数量缺失走默认），
+    # 供 GUI 弹出规格补齐选项；不写入 Excel（to_dict 不导出）。
+    spec_unreliable: bool = False
 
     def to_dict(self):
         return {
@@ -79,6 +82,24 @@ SHOP_KEYWORDS = [
     "商店", "嗨酒", "酒类", "酒行", "酒业", "酒栈", "酒零鹿",
     "鸡尾酒", "酒水", "酒屋",
 ]
+
+JD_PLATFORM = "京东闪送"
+_JD_SERVICE_KEYWORDS = ("京东秒送", "京东闪送")
+
+
+def _is_jd_checkout(full_text):
+    """判断是否为京东秒送/闪送结算页。
+
+    “京东酒世界”可能只是店铺名称，只有出现配送服务标识，或同时出现
+    京东结算页的关键字段时才切换平台，避免误把美团/淘宝截图改成京东。
+    """
+    if any(keyword in full_text for keyword in _JD_SERVICE_KEYWORDS):
+        return True
+    return (
+        "京东" in full_text
+        and "商品金额" in full_text
+        and "应付总额" in full_text
+    )
 
 
 def detect_brand(product_name):
@@ -286,6 +307,132 @@ def _find_delivery_fee(lines, target_top, x_threshold=0.4):
             if corrected < prev_price:
                 return corrected
     return last_price
+
+
+def _prices_on_row(lines, target_top, x_threshold=0.4):
+    """提取同一行右侧的全部金额，保留页面从左到右的顺序。"""
+    prices = []
+    for item in lines:
+        if abs(item["top"] - target_top) >= 0.02 or item["left"] <= x_threshold:
+            continue
+        for raw in re.findall(r'[¥￥]\s*(\d+\.?\d*)', item["text"]):
+            prices.append(_extract_price_safe("¥" + raw))
+    return [price for price in prices if price > 0]
+
+
+def _merge_row_fragments(lines, target_top):
+    """合并同一行（top 相近）的全部文本碎片（按 left 排序拼接）。
+
+    OCR 可能把一个金额拆成两个块，如「应付总额 ¥29.」+「.9 共减¥4.3」，
+    分别提取会得到 29 与 0.9。整行拼接再去重小数点才能还原 29.9。
+    京东结算页金额紧跟左侧标签（不同于美团在右栏），因此不过滤 x 位置。
+    """
+    fragments = []
+    for item in lines:
+        if abs(item["top"] - target_top) >= 0.02:
+            continue
+        text = item["text"].strip()
+        if text:
+            fragments.append((item["left"], text))
+    fragments.sort(key=lambda pair: pair[0])
+    return "".join(text for _, text in fragments)
+
+
+def _fix_duplicated_dot(raw):
+    """「¥29..9」这类拼接出的双小数点 -> 「29.9」。"""
+    return re.sub(r'\.{2,}', '.', raw)
+
+
+def _find_jd_labeled_prices(lines, keyword):
+    """提取京东结算明细指定标签行的金额。
+
+    返回金额保留原始顺序；「已免运费 ¥4.3¥0」中的 ¥0 是实付值，
+    不能当噪声过滤（调用方需要它来计算真实运费）。
+    """
+    idx = _find_line_by_keyword(lines, keyword)
+    if idx < 0:
+        return []
+    target_top = lines[idx]["top"]
+    # 整行拼接后提取：金额可能紧跟标签，也可能拆成右侧续接碎片。
+    sources = [
+        _fix_duplicated_dot(_merge_row_fragments(lines, target_top)),
+        _fix_duplicated_dot(lines[idx]["text"]),
+    ]
+    prices = []
+    for source in sources:
+        for raw in re.findall(r'[¥￥]\s*(\d+\.?\d*)', source):
+            try:
+                prices.append(round(float(raw), 2))
+            except ValueError:
+                continue
+        if prices:
+            break
+    return prices
+
+
+def _find_jd_shipping_price(lines):
+    """提取京东运费实付值，并修复 OCR 漏掉小数点的情况。"""
+    prices = _find_jd_labeled_prices(lines, "运费")
+    if not prices:
+        return 0.0
+    # “已免运费”本身就是实付 0 元；即使 OCR 漏掉右侧的 ¥0，也不能把
+    # 划线运费误写进 L 列。
+    shipping_idx = _find_line_by_keyword(lines, "运费")
+    if shipping_idx >= 0:
+        row_text = _merge_row_fragments(lines, lines[shipping_idx]["top"])
+        if "已免运费" in row_text or "免运费" in row_text:
+            return 0.0
+    price = prices[-1]
+    # 即时配送费通常不超过 40 元；OCR 将 4.8 识别为 48 时还原。
+    if price > 40 and price / 10 <= 40:
+        return round(price / 10, 2)
+    return price
+
+
+def _find_jd_shop_name(lines):
+    """从“秒送 + 店铺 + 京东秒送”卡片行提取店铺名。"""
+    service_items = [
+        item for item in lines
+        if any(keyword in item["text"] for keyword in _JD_SERVICE_KEYWORDS)
+    ]
+    for service_item in service_items:
+        target_top = service_item["top"]
+        candidates = []
+        for item in lines:
+            if abs(item["top"] - target_top) >= 0.02:
+                continue
+            text = item["text"].strip()
+            if not text or item["left"] < 0.1 or item["left"] >= 0.78:
+                continue
+            if any(keyword in text for keyword in _JD_SERVICE_KEYWORDS) or text in ("秒送", "闪送"):
+                continue
+            if re.match(r'^[¥￥\d\.\s/:：\-]+$', text):
+                continue
+            candidates.append((item["left"], text))
+        if candidates:
+            candidates.sort(key=lambda pair: pair[0])
+            return _clean_jd_shop_prefix(candidates[0][1])
+
+    # 某些 OCR 会把服务标签与店铺行合并，只能从“京东酒世界”回退提取。
+    for item in lines:
+        text = item["text"].strip()
+        if "京东酒世界" in text:
+            return _clean_jd_shop_prefix(text)
+    return ""
+
+
+def _clean_jd_shop_prefix(name):
+    """清理店铺名前的服务标识前缀：「自营 秒送 京东酒世界（…）」->「京东酒世界（…）」。
+
+    OCR 常把“自营”“秒送/闪送”徽标与店名读成同一文本块，前缀可能带
+    中文逗号/空格/顿号（如“自营， 秒送”），循环剥离直到店名开头。
+    """
+    cleaned = (name or "").strip()
+    prev = None
+    while prev != cleaned:
+        prev = cleaned
+        cleaned = re.sub(r'^(自营|秒送|闪送)[\s，,、·]*', '', cleaned).strip()
+    return cleaned
 
 
 def _normalize_product_name(title, spec, sub_title="", extra_text=""):
@@ -647,12 +794,20 @@ def _normalize_product_name(title, spec, sub_title="", extra_text=""):
             if unit == "罐":
                 unit = "听"
         else:
-            m = re.search(r'(\d+)\s*(瓶|听|罐|只|支)', clean_title)
+            # 京东标题常被截断成 "500ml*6 默认"（数字后无单位字），
+            # 匹配 "*N" 形式；注意不能匹配进 "U8" 这类型号数字。
+            m = re.search(r'ml\s*[*xX×]\s*(\d+)', clean_title, re.IGNORECASE)
             if m:
                 count = m.group(1)
-                unit = m.group(2)
-                if unit == "罐":
-                    unit = "听"
+            else:
+                m = re.search(r'(\d+)\s*(瓶|听|罐|只|支)', clean_title)
+                # "燕京U8瓶装" 的 "8瓶" 不是数量——数字紧邻的前一个字符
+                # 是字母/数字（型号词的一部分，如 U8、1998、superX）时跳过
+                if m and not re.search(r'[A-Za-z0-9]$', clean_title[:m.start(1)]):
+                    count = m.group(1)
+                    unit = m.group(2)
+                    if unit == "罐":
+                        unit = "听"
 
     # 从缩略图标签提取 "12听装" "12瓶装" "12罐装" 格式
     if not count or (unit == "瓶" and "听" in extra_text):
@@ -709,12 +864,16 @@ def parse_ocr_to_fields(ocr_results, region=""):
     full_text = "\n".join(texts)
 
     # =========================================================
-    # C: 平台识别 - 区分"美团闪购"和"淘宝闪购"
+    # C: 平台识别 - 区分京东闪送、淘宝闪购和美团闪购
     # =========================================================
     # 淘宝闪购特征: "蜂鸟"/"淘金币"(OCR可能误读为"淘金市")/"淘宝"/"提交订单"+"合计"/"商家自配送"
     # 美团闪购特征: "极速支付"/"找人付"/"美团红包"/"共减"等
+    is_jd = _is_jd_checkout(full_text)
     is_taobao = any(k in full_text for k in ["蜂鸟", "淘金币", "淘金市", "淘宝", "提交订单"])
-    if is_taobao:
+    if is_jd:
+        # 截图中官方服务标识为“京东秒送”，表格内部统一归类为“京东闪送”。
+        fields.platform = JD_PLATFORM
+    elif is_taobao:
         fields.platform = "淘宝闪购"
     else:
         fields.platform = "美团闪购"
@@ -725,6 +884,9 @@ def parse_ocr_to_fields(ocr_results, region=""):
     # 优先策略：店铺卡片行 = 店铺名 + 同行"共N件约Xkg"（美团/淘宝结算页标准布局）
     # 页面顶部可能有入口店名（如"雀嘻嘻•24小时自助棋牌"在收货人上方），
     # 但实际订单店铺是配送方式下方、商品上方的卡片行（如"惠到家（远东店） 共1件约6kg"）
+    if fields.platform == JD_PLATFORM:
+        fields.shop_name = _find_jd_shop_name(lines)
+
     if not fields.shop_name:
         for item in lines:
             text = item["text"].strip()
@@ -772,8 +934,8 @@ def parse_ocr_to_fields(ocr_results, region=""):
             if not text:
                 continue
             # 排除明显的非店铺文本
-            if any(k in text for k in ["送出", "送达", "去选择", "自配", "商品总价",
-                                        "打包费", "配送费", "商家活动", "美团红包",
+            if any(k in text for k in ["送出", "送达", "去选择", "自配", "秒送", "闪送", "商品总价",
+                                        "打包费", "配送费", "运费", "商家活动", "美团红包",
                                         "店铺券", "极速支付", "找人付", "共减",
                                         "收货人", "超时退费", "安心购", "赠"]):
                 continue
@@ -817,7 +979,7 @@ def parse_ocr_to_fields(ocr_results, region=""):
                 if not text:
                     continue
                 # 排除所有非店铺文本
-                if any(k in text for k in ["送出", "送达", "去选择", "自配",
+                if any(k in text for k in ["送出", "送达", "去选择", "自配", "秒送", "闪送",
                                             "美团快送", "1对1急送", "到店自取",
                                             "送货上门", "立即送出", "商品总价",
                                             "打包费", "配送费", "商家活动",
@@ -948,6 +1110,7 @@ def parse_ocr_to_fields(ocr_results, region=""):
     product_title = ""
     spec_text = ""
     sub_title = ""
+    product_title_top = None
 
     for i, item in enumerate(lines):
         text = item["text"].strip()
@@ -993,6 +1156,7 @@ def parse_ocr_to_fields(ocr_results, region=""):
 
         # 清理 OCR 噪声
         product_title = text
+        product_title_top = item["top"]
         # 向下找规格行和副标题行
         for j in range(i + 1, min(i + 8, len(lines))):
             spec = lines[j]["text"].strip()
@@ -1028,6 +1192,21 @@ def parse_ocr_to_fields(ocr_results, region=""):
     # 标准化产品名称
     if product_title:
         fields.product_name = _normalize_product_name(product_title, spec_text, sub_title, extra_text.strip())
+
+    # 规格可靠性检测：只有数量走默认回退（*12）且整页找不到任何数量证据
+    # 时才标记为需人工确认（如标题截断「燕京U8小.」）。从 OCR 直接提取的
+    # 数量（*6、12听装 等）视为可靠，不打扰用户。
+    if fields.product_name and re.search(r'\*12\s*(瓶|听)$', fields.product_name):
+        # 证据：容量*数量（"500ml*6"）或 N瓶/听/罐（"12听装"）；不匹配 "×1" 购买数量
+        has_evidence = bool(
+            re.search(r'\d+\s*m[l1]\s*[*xX×]\s*\d+', full_text, re.IGNORECASE)
+            or re.search(r'\d+\s*(瓶|听|罐)', full_text)
+            or re.search(r'\d+\s*(瓶|听|罐)', spec_text)
+        )
+        if not has_evidence:
+            fields.spec_unreliable = True
+            if "产品规格需人工确认" not in fields.remark:
+                fields.remark = (fields.remark + "；" if fields.remark else "") + "产品规格需人工确认"
 
     # =========================================================
     # F: 产品原价 — 统一为"含配送打包的总价"口径
@@ -1124,6 +1303,27 @@ def parse_ocr_to_fields(ocr_results, region=""):
                 if fields.original_price > 0:
                     break
 
+    # 京东秒送结算页没有“总价/商品总价”行：商品卡片右侧通常显示划线原价和
+    # 当前商品金额，分别对应 F 列商品标价与后续理论成交价。
+    jd_goods_amount = 0.0
+    if fields.platform == JD_PLATFORM:
+        jd_product_prices = (
+            _prices_on_row(lines, product_title_top)
+            if product_title_top is not None else []
+        )
+        if jd_product_prices:
+            fields.original_price = jd_product_prices[0]
+        jd_amount_prices = _find_jd_labeled_prices(lines, "商品金额")
+        if jd_amount_prices:
+            jd_goods_amount = jd_amount_prices[0]
+        elif len(jd_product_prices) >= 2:
+            jd_goods_amount = jd_product_prices[-1]
+        if fields.original_price == 0.0 and jd_goods_amount > 0:
+            fields.original_price = jd_goods_amount
+        # 划线价与商品金额的差额属于商品活动优惠；运费优惠不计入 H 列。
+        if fields.original_price > jd_goods_amount > 0:
+            fields.shop_discount = round(fields.original_price - jd_goods_amount, 2)
+
     # =========================================================
     # G: 产品成交单价 - 底部总价 "¥39.4共减¥27.1" 这种格式
     # =========================================================
@@ -1133,6 +1333,13 @@ def parse_ocr_to_fields(ocr_results, region=""):
 
     # 策略1: 找 "¥xx.x共减" 连在一起的完整格式
     found_final = False
+    if fields.platform == JD_PLATFORM:
+        # 京东使用“应付总额 ¥64.8 共减¥5”（金额在前、共减在后），
+        # 该行位于支付按钮上方，不依赖美团底部 top<0.08 的布局判断。
+        jd_total_prices = _find_jd_labeled_prices(lines, "应付总额")
+        if jd_total_prices:
+            fields.final_price = jd_total_prices[0]
+            found_final = True
     for item in lines:
         text = item["text"]
         # 必须同时包含¥和共减，且¥在共减前面
@@ -1249,6 +1456,11 @@ def parse_ocr_to_fields(ocr_results, region=""):
                             fields.shop_discount = float(m.group(1))
                             break
 
+    # 京东“活动减 X 元运费”只作用于运费，不属于商品活动；商品卡片划线价
+    # 与商品金额的差额才计入 H 列。
+    if fields.platform == JD_PLATFORM and fields.original_price > jd_goods_amount > 0:
+        fields.shop_discount = round(fields.original_price - jd_goods_amount, 2)
+
     # =========================================================
     # I: 满减活动 - "满减" 或 "店铺券/商品券" 行
     # 注意：店铺券/商品券归入满减活动(I列)，不归入优惠券(J列)
@@ -1346,6 +1558,14 @@ def parse_ocr_to_fields(ocr_results, region=""):
                             fields.coupon = price
                             break
 
+    # 京东使用“优惠券”作为平台券入口；与美团“神券/红包”同属 J 列。
+    # 只读取同一标签行的金额，避免把商品卡片或应付总额中的金额误当优惠券。
+    if fields.platform == JD_PLATFORM and fields.coupon == 0.0:
+        jd_coupon_prices = _find_jd_labeled_prices(lines, "优惠券")
+        positive_prices = [price for price in jd_coupon_prices if price > 0]
+        if positive_prices:
+            fields.coupon = positive_prices[-1]
+
     # =========================================================
     # K: 红包 - 淘宝闪购有"平台红包"，美团基本为0
     # 美团红包行实际显示的是神券，已归入优惠券(J列)
@@ -1378,6 +1598,26 @@ def parse_ocr_to_fields(ocr_results, region=""):
         # 配送费行可能有 "¥7 ¥1.5>" 格式（原价和优惠后），取最后一个
         # 使用专门的配送费提取函数处理 OCR 小数点丢失
         ship_fee = _find_delivery_fee(lines, lines[ship_idx]["top"])
+
+    # 京东标签为“运费”，同一行是「划线原价 + 活动后实付价」。
+    # 实付价是真正计入 L 列的金额：“已免运费 ¥4.3¥0”实付 0 元，
+    # 「活动减5元运费 ¥5.8¥0.8」实付 0.8 元，都取最后一个（可能为 0）。
+    if fields.platform == JD_PLATFORM:
+        jd_shipping_prices = _find_jd_labeled_prices(lines, "运费")
+        jd_shipping_price = _find_jd_shipping_price(lines)
+        if jd_shipping_price > 0:
+            ship_fee = jd_shipping_price
+        shipping_promo = re.search(r'减\s*(\d+\.?\d*)\s*元运费', full_text)
+        if shipping_promo:
+            promo_remark = f"京东运费活动优惠{shipping_promo.group(1)}元"
+            if promo_remark not in fields.remark:
+                fields.remark = (fields.remark + "；" if fields.remark else "") + promo_remark
+        elif len(jd_shipping_prices) >= 2 and jd_shipping_prices[-1] == 0:
+            waived = jd_shipping_prices[-2]
+            if waived > 0:
+                promo_remark = f"京东运费优惠{waived:g}元"
+                if promo_remark not in fields.remark:
+                    fields.remark = (fields.remark + "；" if fields.remark else "") + promo_remark
 
     fields.delivery_fee = pack_fee + ship_fee
 

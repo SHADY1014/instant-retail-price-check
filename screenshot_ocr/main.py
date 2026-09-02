@@ -2,17 +2,19 @@
 即时零售截图价格核查工具 - PyQt5 桌面 GUI
 
 使用流程：
-  1. 导入美团截图（拖拽/选择/压缩包）
+  1. 导入即时零售截图（拖拽/选择/压缩包）
   2. 点击"开始识别" -> macOS Vision OCR + 字段解析
   3. 在表格中预览/修正识别结果
      - 可直接编辑每行的"所属区域"
      - 选中多行后点击"批量设置区域"一次性修改
   4. 点击"导出Excel" -> 自动按品牌分类，写入4个子表
 
-完全本地运行，零网络请求，零封号风险。
+核心 OCR 与字段解析完全本地运行；只有用户主动使用联网识别城市时才发送店铺名称。
 """
 
 import os
+import logging
+import re
 import sys
 import tempfile
 import threading
@@ -54,10 +56,15 @@ from city_pool import format_region, get_cities, get_provinces
 from ocr_engine import run_ocr_parallel
 from field_parser import FormFields, parse_ocr_to_fields, detect_brand
 from review_rules import find_review_issues
-from city_detector import detect_city_in_region
+from city_detector import (
+    batch_lookup_local_cities,
+    detect_city_decision_in_region,
+)
 import summary_generator
 import summary_speech
 import excel_writer
+
+logger = logging.getLogger(__name__)
 
 
 def _open_folder(path):
@@ -127,6 +134,7 @@ class OCRWorker(QThread):
         self._cancel_event.set()
 
     def run(self):
+        logger.info("ocr_worker_start images=%d", len(self.image_paths))
         results = {}
         total = len(self.image_paths)
         if total == 0:
@@ -145,11 +153,18 @@ class OCRWorker(QThread):
                     message = "识别完成"
                 self.progress.emit(done, _total, message)
 
-        ocr_map = run_ocr_parallel(
-            self.image_paths,
-            progress_callback=on_done,
-            should_cancel=self._cancel_event.is_set,
-        )
+        try:
+            ocr_map = run_ocr_parallel(
+                self.image_paths,
+                progress_callback=on_done,
+                should_cancel=self._cancel_event.is_set,
+            )
+        except Exception as exc:
+            # 初始化 Vision/Swift 失败时也必须结束线程，避免界面永久显示“识别中”。
+            logger.exception("ocr_batch_failed images=%d", len(self.image_paths))
+            ocr_map = {
+                path: {"error": str(exc)} for path in self.image_paths
+            }
 
         retry_paths = []
         for path in self.image_paths:
@@ -163,7 +178,12 @@ class OCRWorker(QThread):
                 fields.remark = f"OCR失败: {ocr_data['error']}"
                 retry_paths.append(path)
             else:
-                fields = parse_ocr_to_fields(ocr_data)
+                try:
+                    fields = parse_ocr_to_fields(ocr_data)
+                except Exception:
+                    logger.exception("field_parse_failed image=%s", path)
+                    fields = FormFields()
+                    fields.remark = "字段解析失败，详见日志"
             results[path] = fields
 
         message = "识别已取消" if self._cancel_event.is_set() else "识别完成"
@@ -430,25 +450,27 @@ class RegionNetworkWorker(QThread):
         super().__init__()
         self.shop_names = list(shop_names)
         self.restrict_cities = set(restrict_cities)
+        self.review_decisions = {}
+        self.network_shops = []
 
     def run(self):
+        try:
+            self._run_impl()
+        except Exception:
+            logger.exception("region_city_worker_failed")
+            self.finished_cities.emit({})
+
+    def _run_impl(self):
         if not self.shop_names:
             self.finished_cities.emit({})
             return
 
         # 先批量查本地数据库。只接受所选范围内的 L1-L4 高可信命中；
         # 范围外或 L5 模糊候选必须继续受限联网查询，不能写入表格。
-        import database
-        matched = database.batch_get_shop_city(self.shop_names)
-        cached = {
-            name: value["city"]
-            for name, value in matched.items()
-            if value.get("city") in self.restrict_cities
-            and not value.get("conflict")
-            and value.get("level", 99) <= 4
-        }
+        cached = batch_lookup_local_cities(self.shop_names, self.restrict_cities)
         results = dict(cached)
         pending = [n for n in self.shop_names if n not in cached]
+        self.network_shops = list(pending)
 
         total = len(self.shop_names)
         self.progress.emit(
@@ -456,61 +478,89 @@ class RegionNetworkWorker(QThread):
             f"联网识别 {len(pending)} 家（限定区域）..."
         )
 
-        # 限定区域联网识别
+        # 仅高置信度结果自动写入；歧义候选集中交给人工确认。
         for i, name in enumerate(pending):
             self.progress.emit(f"联网识别中: {name} ({i+1}/{len(pending)})")
-            city = detect_city_in_region(name, self.restrict_cities)
-            if city:
-                results[name] = city
-            import time
+            decision = detect_city_decision_in_region(name, self.restrict_cities)
+            if decision.auto_accept and decision.city in self.restrict_cities:
+                results[name] = decision.city
+            elif decision.city or decision.candidates:
+                self.review_decisions[name] = decision
             time.sleep(0.3)
 
         self.finished_cities.emit(results)
 
 
-class NetworkCityReviewDialog(QDialog):
-    """Confirm network city candidates before writing them to the table."""
+class NetworkCandidateReviewDialog(QDialog):
+    """Review ambiguous online city candidates and their evidence."""
 
-    def __init__(self, candidates, allowed_cities, parent=None):
+    def __init__(self, decisions, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("确认联网识别城市")
-        self.setMinimumSize(640, 360)
-        self._city_choices = {}
+        self.setWindowTitle("确认联网城市候选")
+        self.setModal(True)
+        self.setMinimumSize(860, 480)
+        self._selectors = {}
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            "请确认每家店铺的候选城市。留空表示不采用该候选；"
-            "仅可选择本次已授权的城市范围。"
-        ))
-        table = QTableWidget(len(candidates), 3)
-        table.setHorizontalHeaderLabels(["店铺", "系统候选", "确认城市"])
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        for row, shop_name in enumerate(sorted(candidates)):
-            candidate = candidates[shop_name]
+        hint = QLabel(
+            "以下店铺的联网结果证据不足或存在冲突，默认不会写入所属区域。"
+            "确认后才会填入并保存为人工知识。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #555; font-size: 12px;")
+        layout.addWidget(hint)
+
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["店铺", "推荐城市", "候选依据", "人工确认"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.NoSelection)
+        table.setWordWrap(True)
+
+        for row, (shop_name, decision) in enumerate(sorted(decisions.items())):
+            table.insertRow(row)
             table.setItem(row, 0, QTableWidgetItem(shop_name))
-            table.setItem(row, 1, QTableWidgetItem(candidate or "未找到"))
-            combo = QComboBox()
-            combo.addItem("不采用")
-            combo.addItems(sorted(allowed_cities))
-            if candidate and candidate in allowed_cities:
-                combo.setCurrentText(candidate)
-            self._city_choices[shop_name] = combo
-            table.setCellWidget(row, 2, combo)
-        layout.addWidget(table)
+            table.setItem(row, 1, QTableWidgetItem(decision.city or "无推荐"))
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("确认并填入")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+            candidate_lines = [decision.reason]
+            for candidate in decision.candidates[:3]:
+                evidence = "；".join(candidate.evidence[:2]) or "地图候选"
+                poi_name = candidate.poi_names[0] if candidate.poi_names else ""
+                poi_detail = f"，POI：{poi_name}" if poi_name else ""
+                candidate_lines.append(
+                    f"{candidate.city} {candidate.score} 分：{evidence}{poi_detail}"
+                )
+            table.setItem(row, 2, QTableWidgetItem("\n".join(candidate_lines)))
 
-    def get_decisions(self):
+            selector = QComboBox()
+            selector.addItem("暂不填入", "")
+            for candidate in decision.candidates:
+                selector.addItem(
+                    f"{candidate.city}（{candidate.score} 分）", candidate.city)
+            table.setCellWidget(row, 3, selector)
+            self._selectors[shop_name] = selector
+            table.setRowHeight(row, 60)
+
+        table.setColumnWidth(0, 210)
+        table.setColumnWidth(1, 100)
+        table.setColumnWidth(2, 420)
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table, 1)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText("应用已确认城市")
+        button_box.button(QDialogButtonBox.Cancel).setText("暂不处理")
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def get_confirmed_cities(self):
+        """Return only deliberate city selections."""
         return {
-            shop_name: combo.currentText() if combo.currentIndex() > 0 else ""
-            for shop_name, combo in self._city_choices.items()
+            shop_name: selector.currentData()
+            for shop_name, selector in self._selectors.items()
+            if selector.currentData()
         }
 
 
@@ -791,6 +841,102 @@ class ProductSelectDialog(QDialog):
         return self._product_type
 
 
+class SpecCompletionDialog(QDialog):
+    """产品规格补齐对话框
+
+    产品规格无法从截图可靠识别（数量走默认回退）时弹出，
+    让用户从 6/12 听/瓶 中选择正确规格并回写表格。
+    """
+
+    # (选项值, 显示文本)；值为空表示维持默认
+    SPEC_OPTIONS = [
+        ("", "维持默认（保留待核对）"),
+        ("500ml*6听", "500ml*6听"),
+        ("500ml*6瓶", "500ml*6瓶"),
+        ("500ml*12听", "500ml*12听"),
+        ("500ml*12瓶", "500ml*12瓶"),
+    ]
+
+    def __init__(self, rows, parent=None):
+        """Args:
+            rows: list[(path, shop_name, product_name)] 规格存疑的记录
+        """
+        super().__init__(parent)
+        self.setWindowTitle("产品规格补齐")
+        self.setModal(True)
+        self.setMinimumSize(600, 320)
+        self._combos = {}  # path -> QComboBox
+
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(
+            f"以下 {len(rows)} 条记录的产品规格无法从截图可靠识别"
+            f"（当前为默认值），请选择正确规格："
+        )
+        hint.setStyleSheet("font-size: 13px; color: #333; padding: 6px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        from PyQt5.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        col_layout = QVBoxLayout(content)
+        for path, shop, product in rows:
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            label = QLabel(f"{shop}\n{product}")
+            label.setStyleSheet("font-size: 12px; color: #444; padding: 4px;")
+            label.setWordWrap(True)
+            label.setMinimumWidth(300)
+            combo = QComboBox()
+            for value, text in self.SPEC_OPTIONS:
+                combo.addItem(text, value)
+            combo.setMinimumWidth(170)
+            row_layout.addWidget(label, 1)
+            row_layout.addWidget(combo)
+            col_layout.addWidget(row_widget)
+            self._combos[path] = combo
+        col_layout.addStretch()
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.button(QDialogButtonBox.Ok).setText("确定")
+        btn_box.button(QDialogButtonBox.Cancel).setText("暂不处理")
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def get_choices(self):
+        """返回 {path: spec}；spec 为空表示用户选择维持默认。"""
+        return {
+            path: combo.currentData()
+            for path, combo in self._combos.items()
+            if combo.currentData()
+        }
+
+
+def _replace_product_spec(product_name, selected_spec):
+    """Replace the complete inferred package spec without duplicating capacity.
+
+    ``selected_spec`` contains both capacity and quantity (for example
+    ``500ml*6瓶``), so replacing only ``*12瓶`` would produce
+    ``500ml500ml*6瓶``.  Keep this operation pure so the GUI update is easy to
+    test and future spec options can reuse it.
+    """
+    if not selected_spec:
+        return product_name
+    updated, count = re.subn(
+        r"\d+\s*(?:ml|m[l1]|L)\s*\*\s*\d+\s*(?:瓶|听)",
+        selected_spec,
+        product_name or "",
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return updated if count else (product_name or "")
+
+
 class DuplicateReviewDialog(QDialog):
     """重复核查对话框
 
@@ -1004,7 +1150,7 @@ class MainWindow(QWidget):
         layout = QVBoxLayout(self)
 
         # ========== 顶部：图片导入 ==========
-        img_group = QGroupBox("① 导入美团截图")
+        img_group = QGroupBox("① 导入即时零售截图")
         img_layout = QVBoxLayout(img_group)
 
         self.drop_area = DropArea(self._on_files_added, self._paste_from_clipboard)
@@ -1246,53 +1392,61 @@ class MainWindow(QWidget):
         self.status_label.setText("联网识别中，请稍候...")
 
     def _on_region_cities_detected(self, shop_to_city):
-        """Record candidates, then apply only user-confirmed city decisions."""
+        """Apply safe decisions, then offer ambiguous candidates for review."""
         if not self._network_request_id:
             self.status_label.setText("联网识别完成，但审计请求不存在")
             return
 
-        all_candidates = {
-            shop: shop_to_city.get(shop, "")
-            for shop in self._region_worker.shop_names
+        allowed = set(getattr(self._region_worker, "restrict_cities", set()))
+        network_shops = set(getattr(self._region_worker, "network_shops", []))
+        review_decisions = getattr(self._region_worker, "review_decisions", {}) or {}
+        if not allowed:
+            self.status_label.setText("联网识别未找到任何城市")
+            return
+
+        candidate_cities = {
+            shop: (review_decisions[shop].city
+                   if shop in review_decisions
+                   else (shop_to_city or {}).get(shop, ""))
+            for shop in network_shops
         }
         try:
             import database
             database.record_network_city_candidates(
-                self._network_request_id, all_candidates, source="region_match"
+                self._network_request_id, candidate_cities,
+                source="baidu_map_score"
             )
         except Exception as exc:
             QMessageBox.warning(self, "审计记录失败", str(exc))
             return
 
-        dialog = NetworkCityReviewDialog(
-            all_candidates, self._region_worker.restrict_cities, self
-        )
-        if dialog.exec_() != QDialog.Accepted:
-            self.status_label.setText("已保留联网候选，未应用任何城市结果")
-            return
-        shop_to_city = dialog.get_decisions()
+        manual_mappings = {}
+        if review_decisions:
+            dialog = NetworkCandidateReviewDialog(review_decisions, self)
+            if dialog.exec_() == QDialog.Accepted:
+                manual_mappings = dialog.get_confirmed_cities()
+
+        final_decisions = {
+            shop: (shop_to_city or {}).get(shop, "") for shop in network_shops
+        }
+        for shop in review_decisions:
+            final_decisions[shop] = manual_mappings.get(shop, "")
         try:
             database.record_network_city_decisions(
-                self._network_request_id, shop_to_city
+                self._network_request_id, final_decisions
             )
         except Exception as exc:
             QMessageBox.warning(self, "审计记录失败", str(exc))
             return
 
-        updated = 0
-        for row in range(self.table.rowCount()):
-            shop_item = self.table.item(row, 3)
-            if shop_item and shop_item.text().strip():
-                city = shop_to_city.get(shop_item.text().strip())
-                if city:
-                    region = format_region(city.replace("市", ""))
-                    region_item = self.table.item(row, 1)
-                    if region_item:
-                        region_item.setText(region)
-                    else:
-                        region_item = QTableWidgetItem(region)
-                        self.table.setItem(row, 1, region_item)
-                    updated += 1
+        # Local matches are safe automatic results as well; they are omitted
+        # from the network audit subset, so apply both maps to the table.
+        auto_updated, rejected = self._apply_network_city_results(
+            shop_to_city or {}, allowed)
+        manual_updated, manual_rejected = self._apply_network_city_results(
+            manual_mappings, allowed)
+        rejected += manual_rejected
+        self._learn_network_city_reviews(manual_mappings)
 
         # 统计仍未识别的
         still_miss = 0
@@ -1307,13 +1461,45 @@ class MainWindow(QWidget):
         self._sort_table_by_region()
         if still_miss > 0:
             self.status_label.setText(
-                f"联网识别完成，已填入 {updated} 行城市，"
+                f"联网识别完成，自动填入 {auto_updated} 行，"
+                f"人工确认 {manual_updated} 行，"
                 f"剩余 {still_miss} 行未识别（可点击\"🌐 联网识别城市\"手动修正）"
             )
         else:
             self.status_label.setText(
-                f"联网识别完成，已填入 {updated} 行城市，全部识别成功"
+                f"联网识别完成，自动填入 {auto_updated} 行，"
+                f"人工确认 {manual_updated} 行，共填入 "
+                f"{auto_updated + manual_updated} 行城市"
             )
+
+        if rejected:
+            logger.warning("region_callback rejected_out_of_range_count=%d", rejected)
+
+    def _apply_network_city_results(self, shop_to_city, allowed):
+        """Apply in-range city mappings and report updated/rejected rows."""
+        updated = 0
+        rejected = 0
+        for row in range(self.table.rowCount()):
+            shop_item = self.table.item(row, 3)
+            if not shop_item or not shop_item.text().strip():
+                continue
+            shop_name = shop_item.text().strip()
+            city = shop_to_city.get(shop_name)
+            if city in allowed:
+                region = format_region(city.replace("市", ""))
+                region_item = self.table.item(row, 1)
+                if region_item:
+                    region_item.setText(region)
+                else:
+                    self.table.setItem(row, 1, QTableWidgetItem(region))
+                updated += 1
+            elif city:
+                rejected += 1
+                logger.warning(
+                    "region_callback_rejected_out_of_range shop=%r city=%r allowed=%s",
+                    shop_name, city, sorted(allowed),
+                )
+        return updated, rejected
 
     def _on_files_added(self, files):
         """处理拖拽或选择的文件，自动识别图片和压缩包"""
@@ -1431,7 +1617,7 @@ class MainWindow(QWidget):
 
     def _select_files(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "选择美团截图", "",
+            self, "选择即时零售截图", "",
             "图片文件 (*.png *.jpg *.jpeg *.webp)"
         )
         if files:
@@ -1506,7 +1692,7 @@ class MainWindow(QWidget):
             return
         image_paths = self._retry_paths if retry else self.image_paths
         if not image_paths:
-            QMessageBox.warning(self, "提示", "请先导入美团截图")
+            QMessageBox.warning(self, "提示", "请先导入即时零售截图")
             return
 
         self._ocr_is_retry = retry
@@ -1567,6 +1753,9 @@ class MainWindow(QWidget):
             return
 
         self._populate_table()
+
+        # 规格无法可靠识别的行弹窗补齐（6/12 听/瓶），确认后回写表格
+        self._prompt_spec_completion()
 
         # 先让用户选择省份+城市，限定数据库匹配范围（更精准，避免跨城误匹配）
         dialog = ProvinceCitySelectDialog(len(results), self)
@@ -1817,6 +2006,47 @@ class MainWindow(QWidget):
                     self.table.setItem(row_idx, col, item)
 
         self.table.resizeRowsToContents()
+        self._refresh_review_state()
+
+    def _prompt_spec_completion(self):
+        """规格无法可靠识别的行弹窗补齐（500ml*6/12 听/瓶）。
+
+        用户选择具体规格后回写产品名并清除存疑标记；
+        选「维持默认」保留待核对标记，由用户手动处理。
+        """
+        rows = [
+            (path, fields.shop_name, fields.product_name)
+            for path, fields in self.ocr_results.items()
+            if getattr(fields, "spec_unreliable", False)
+        ]
+        if not rows:
+            return
+
+        dialog = SpecCompletionDialog(rows, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        choices = dialog.get_choices()  # {path: "500ml*6听"}；维持默认的 key 不存在
+
+        # 用缩略图列的图片路径定位表格行（范式见 _update_retry_rows）
+        rows_by_path = {}
+        for row in range(self.table.rowCount()):
+            image_item = self.table.item(row, len(TABLE_COLUMNS))
+            if image_item:
+                rows_by_path[image_item.data(Qt.UserRole)] = row
+
+        for path, spec in choices.items():
+            row = rows_by_path.get(path)
+            if row is None:
+                continue
+            # 替换完整规格，避免把容量重复拼接：燕京U8 500ml*12瓶 -> 500ml*6听
+            name_item = self.table.item(row, 4)  # E列=产品名称
+            if name_item and spec:
+                name_item.setText(_replace_product_spec(name_item.text(), spec))
+            # 已确认规格，清除存疑标记（备注中的提示一并移除）
+            remark_item = self.table.item(row, 13)  # P列=备注
+            if remark_item:
+                cleaned = remark_item.text().replace("产品规格需人工确认", "").strip("；")
+                remark_item.setText(cleaned)
         self._refresh_review_state()
 
     def _populate_table(self):

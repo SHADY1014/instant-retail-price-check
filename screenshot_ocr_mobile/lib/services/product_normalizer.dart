@@ -45,7 +45,8 @@ class ProductNormalizer {
     else if (cleanTitle.contains('燕京') ||
         RegExp(r'燕[.\s]*$').hasMatch(cleanTitle)) {
       var model = '';
-      final m = RegExp(r'U\s*(\d+)', caseSensitive: false).firstMatch(cleanTitle);
+      final m =
+          RegExp(r'U\s*(\d+)', caseSensitive: false).firstMatch(cleanTitle);
       if (m != null) {
         var num = m.group(1)!;
         if (num == '88') num = '8'; // OCR 误读修正
@@ -84,7 +85,8 @@ class ProductNormalizer {
         degree = RegExp(r'(\d+)\s*°\s*[Pp]').firstMatch(combined)!.group(1);
       } else if (RegExp(r'(\d+)\s*°(?!\s*[Pp])').hasMatch(combined)) {
         degree = RegExp(r'(\d+)\s*°(?!\s*[Pp])').firstMatch(combined)!.group(1);
-      } else if (RegExp(r'superx\s*(\d+)', caseSensitive: false).hasMatch(combined)) {
+      } else if (RegExp(r'superx\s*(\d+)', caseSensitive: false)
+          .hasMatch(combined)) {
         degree = RegExp(r'superx\s*(\d+)', caseSensitive: false)
             .firstMatch(combined)!
             .group(1);
@@ -92,16 +94,16 @@ class ProductNormalizer {
 
       if (isSuperx) {
         // superx 系列: "雪花啤酒8°P勇闯天涯superx"
-        productBase = degree != null
-            ? '雪花啤酒${degree}°P勇闯天涯superx'
-            : '雪花啤酒8°P勇闯天涯superx';
+        productBase =
+            degree != null ? '雪花啤酒${degree}°P勇闯天涯superx' : '雪花啤酒8°P勇闯天涯superx';
       } else if (cleanTitle.contains('老雪') || cleanTitle.contains('老雪花')) {
         productBase = degree != null ? '雪花老雪${degree}度' : '雪花老雪12度';
       } else if (cleanTitle.contains('勇闯') || subTitle.contains('勇闯')) {
         productBase = degree != null ? '雪花勇闯${degree}度' : '雪花勇闯10度';
       } else if (cleanTitle.contains('超爽') || subTitle.contains('超爽')) {
         productBase = degree != null ? '雪花超爽${degree}度' : '雪花超爽8度';
-      } else if (cleanTitle.contains('老雪') || cleanTitle.contains('老雪花') ||
+      } else if (cleanTitle.contains('老雪') ||
+          cleanTitle.contains('老雪花') ||
           combined.contains('640')) {
         // 老雪/640ml 瓶装系列（雪花640ml基本是老雪）
         productBase = degree != null ? '雪花老雪${degree}度' : '雪花老雪12度';
@@ -142,7 +144,8 @@ class ProductNormalizer {
         productBase = '青岛啤酒7天13P原浆啤酒';
       } else if (combined.contains('奥古特')) {
         productBase = degree != null ? '青岛${degree}度奥古特' : '青岛12度奥古特';
-      } else if (combined.contains('2000') || combined.contains('200.') ||
+      } else if (combined.contains('2000') ||
+          combined.contains('200.') ||
           combined.contains('200…')) {
         // 青岛2000 10度（OCR 可能将 "2000" 截断为 "200." 或 "200…"）
         productBase = degree != null ? '青岛2000 ${degree}度' : '青岛2000 10度';
@@ -151,8 +154,10 @@ class ProductNormalizer {
         productBase = degree != null ? '青岛${degree}度白啤' : '青岛11度白啤';
       } else if (combined.contains('纯生')) {
         productBase = degree != null ? '青岛纯生${degree}度' : '青岛纯生8度';
-      } else if (combined.contains('冰醇') || combined.contains('冰纯') ||
-          combined.contains('冰…') || combined.contains('冰.')) {
+      } else if (combined.contains('冰醇') ||
+          combined.contains('冰纯') ||
+          combined.contains('冰…') ||
+          combined.contains('冰.')) {
         productBase = degree != null ? '青岛冰醇${degree}度' : '青岛冰醇8度';
       } else if (combined.contains('经典')) {
         productBase = degree != null ? '青岛经典${degree}度' : '青岛经典10度';
@@ -188,24 +193,22 @@ class ProductNormalizer {
       }
 
       if (combined.contains('纯生')) {
-        productBase = degreeVal != null
-            ? '百威${degreeVal}°纯生啤酒'
-            : '百威8°纯生啤酒';
+        productBase = degreeVal != null ? '百威${degreeVal}°纯生啤酒' : '百威8°纯生啤酒';
       } else if (combined.contains('铝罐') || combined.contains('铝管')) {
         // 百威铝管啤酒（用户标准用"铝管"）
         productBase = '百威铝管啤酒';
       } else {
-        productBase = degreeVal != null
-            ? '百威${degreeVal}°啤酒'
-            : '百威9.7°啤酒';
+        productBase = degreeVal != null ? '百威${degreeVal}°啤酒' : '百威9.7°啤酒';
       }
     }
     // --- 哈啤（哈尔滨啤酒）系列 ---
     else if (cleanTitle.contains('哈啤') ||
         cleanTitle.contains('哈尔滨') ||
         cleanTitle.toLowerCase().contains('harbin')) {
-      if (combined.contains('冰纯') || combined.contains('纯生') ||
-          combined.contains('冰…') || combined.contains('冰.')) {
+      if (combined.contains('冰纯') ||
+          combined.contains('纯生') ||
+          combined.contains('冰…') ||
+          combined.contains('冰.')) {
         // OCR 可能将"冰纯"截断为"冰…"或"冰."
         productBase = '哈尔滨冰纯';
       } else if (combined.contains('小麦王') || combined.contains('小麦')) {
@@ -222,10 +225,7 @@ class ProductNormalizer {
     }
     // --- 其他 ---
     else {
-      productBase = cleanTitle
-          .replaceAll('瓶装', '')
-          .replaceAll('听装', '')
-          .trim();
+      productBase = cleanTitle.replaceAll('瓶装', '').replaceAll('听装', '').trim();
       // 去掉尾部 "8." 这类 OCR 截断残留
       productBase = productBase.replaceAll(RegExp(r'\d+\.\s*$'), '').trim();
     }
@@ -241,7 +241,8 @@ class ProductNormalizer {
     String capacity = '';
     var m = RegExp(r'(\d+)\s*ml', caseSensitive: false).firstMatch(cleanSpec);
     if (m == null) {
-      m = RegExp(r'(\d+)\s*m\s*[l1]', caseSensitive: false).firstMatch(cleanSpec);
+      m = RegExp(r'(\d+)\s*m\s*[l1]', caseSensitive: false)
+          .firstMatch(cleanSpec);
     }
     if (m != null) {
       capacity = '${m.group(1)}ml';
@@ -292,6 +293,11 @@ class ProductNormalizer {
         if (m != null) {
           count = m.group(1)!;
           unit = '瓶';
+        } else {
+          // 京东标题常被截断成 "500ml*6 默认"（数字后无单位字）。
+          m = RegExp(r'ml\s*[*xX×]\s*(\d+)', caseSensitive: false)
+              .firstMatch(cleanTitle);
+          if (m != null) count = m.group(1)!;
         }
       }
     }
@@ -305,7 +311,10 @@ class ProductNormalizer {
         if (unit == '罐') unit = '听';
       } else {
         m = RegExp(r'(\d+)\s*(瓶|听|罐|只|支)').firstMatch(cleanTitle);
-        if (m != null) {
+        // “燕京U8瓶装”中的 8 是型号，不是包装数量。
+        if (m != null &&
+            !RegExp(r'[A-Za-z0-9]$')
+                .hasMatch(cleanTitle.substring(0, m.start))) {
           count = m.group(1)!;
           unit = m.group(2)!;
           if (unit == '罐') unit = '听';

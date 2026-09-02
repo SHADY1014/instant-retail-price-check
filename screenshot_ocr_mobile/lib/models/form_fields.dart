@@ -27,6 +27,8 @@ class FormFields {
   double deliveryFee;
   // P: 备注
   String remark;
+  // 产品规格是否由默认值回退，需人工确认
+  bool specUnreliable;
   // 图片路径（移动端用）
   String? imagePath;
 
@@ -44,6 +46,7 @@ class FormFields {
     this.redPacket = 0.0,
     this.deliveryFee = 0.0,
     this.remark = '',
+    this.specUnreliable = false,
     this.imagePath,
   });
 

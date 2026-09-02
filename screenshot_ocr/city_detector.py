@@ -1,23 +1,21 @@
 """
 城市识别模块
 
-通过四层策略识别店铺所在城市：
-0. 本地数据库 - 查询历史识别记录（shop_city.db），命中则直接返回，零网络请求
-1. 店名提取 - 店名中包含城市名（如"广州水荫路店"）
-2. 百度地图搜索建议 - 搜索完整店名，从POI结果提取城市
-3. 分店名关键词映射 - 从分店名中的道路/地标关键词推断城市
-
-识别成功后自动写入本地数据库，下次直接命中。
+通过本地知识、店名/分店证据和百度地图 POI 结果识别店铺所在城市。
+完整店名（包括分店名）优先用于搜索；仅在证据得分和候选分差足够时自动填入。
+歧义结果必须由界面人工确认，只有人工确认的城市才会写入知识库。
 覆盖范围：广东、广西、海南、贵州、云南 五省地级市
 """
 
-import urllib.request
-import urllib.parse
-import urllib.error
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 import json
 import logging
 import re
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import database
 
@@ -47,6 +45,27 @@ def _batch_lookup_learned(shop_names):
     except Exception as exc:
         logger.debug("learning DB batch lookup failed: %s", exc)
         return {}
+
+
+def batch_lookup_local_cities(shop_names, restrict_cities=None):
+    """Read only confirmed learning records within the selected city scope."""
+    names = [name for name in shop_names if name]
+    allowed = None if restrict_cities is None else set(restrict_cities)
+    learned = _batch_lookup_learned(names)
+    result = {}
+    filtered = 0
+
+    for name, city in learned.items():
+        if allowed is None or city in allowed:
+            result[name] = city
+        else:
+            filtered += 1
+
+    logger.info(
+        "local_city_lookup names=%d learned=%d filtered_out_of_range=%d unmatched=%d",
+        len(names), len(result), filtered, len(names) - len(result),
+    )
+    return result
 
 
 # =========================================================
@@ -171,152 +190,320 @@ BRANCH_KEYWORD_MAP = {
 }
 
 
+@dataclass(frozen=True)
+class PoiCandidate:
+    """A Baidu POI suggestion retained with its search context."""
+
+    city: str
+    poi_name: str
+    rank: int
+    query: str
+
+
+@dataclass(frozen=True)
+class CityCandidate:
+    """One city ranked from local textual and POI evidence."""
+
+    city: str
+    score: int
+    evidence: tuple[str, ...]
+    poi_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CityDecision:
+    """A conservative city decision suitable for automatic or manual use."""
+
+    city: str
+    confidence: float
+    auto_accept: bool
+    reason: str
+    candidates: tuple[CityCandidate, ...]
+
+
 def _extract_city_from_name(shop_name):
-    """第一层：从店名中提取城市关键词"""
-    cities = set()
-    for key, full in CITY_KEYS.items():
-        if key in shop_name:
-            cities.add(full)
-    return cities
+    """Return all supported city names mentioned anywhere in a shop name."""
+    return {full for key, full in CITY_KEYS.items() if key in shop_name}
+
+
+def _compact_shop_name(name):
+    """Remove non-semantic noise while keeping branch information intact."""
+    compacted = re.sub(r'[•·\s]+', '', name or "")
+    compacted = re.sub(r'(蜂乌准时达|蜂鸟准时达|商家自配送)', '', compacted)
+    return compacted.strip()
 
 
 def _clean_shop_name(name):
-    """去掉括号及内容、特殊字符、配送后缀，返回干净短名用于搜索"""
-    cleaned = re.sub(r'[（(].*?[）)]', '', name)
-    cleaned = re.sub(r'[•·•\s]+', '', cleaned)
-    cleaned = re.sub(r'(蜂乌准时达|蜂鸟准时达|商家自配送)', '', cleaned)
-    cleaned = cleaned.strip()
-    return cleaned
+    """Return a branch-free fallback query for map search."""
+    cleaned = re.sub(r'[（(].*?[）)]', '', _compact_shop_name(name))
+    return cleaned.strip()
+
+
+def _build_search_queries(shop_name):
+    """Build ordered queries, keeping the complete branch name first."""
+    full_name = _compact_shop_name(shop_name)
+    branch_free = _clean_shop_name(shop_name)
+    queries = [full_name]
+    if branch_free and branch_free != full_name:
+        queries.append(branch_free)
+
+    if len(branch_free) > 6:
+        shortened = re.sub(
+            r'(超市|便利店|便利|百货|商行|量贩|精品|综合).*$', "", branch_free)
+        if shortened and shortened != branch_free:
+            queries.append(shortened)
+        if len(shortened) > 4:
+            queries.append(shortened[:4])
+        if len(shortened) > 3:
+            queries.append(shortened[:3])
+
+    ordered = []
+    for query in queries:
+        if len(query) >= 2 and query not in ordered:
+            ordered.append(query)
+    return ordered
+
+
+def _search_baidu_candidates(shop_name, timeout=10, restrict_cities=None):
+    """Return ordered in-range POI candidates from Baidu map suggestions.
+
+    The old interface returned a set of cities, which discarded the POI name
+    and result order required to make a reliable choice.  Search the complete
+    shop name, including its branch suffix, before broader fallback queries.
+    """
+    allowed = VALID_CITIES if restrict_cities is None else set(restrict_cities)
+    if not allowed:
+        return []
+
+    for query_text in _build_search_queries(shop_name):
+        query = urllib.parse.quote(query_text)
+        url = (
+            "https://map.baidu.com/su?wd="
+            f"{query}&cid=1&type=0&newmap=1&from=webmap&prod=0"
+        )
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36"
+                ),
+                "Referer": "https://map.baidu.com/",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", errors="ignore")
+            data = json.loads(raw)
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                json.JSONDecodeError, OSError) as exc:
+            logger.warning("百度地图搜索失败 (query=%s): %s", query_text, exc)
+            continue
+
+        candidates = []
+        for rank, item in enumerate(data.get("s", [])[:10]):
+            if not isinstance(item, str):
+                continue
+            parts = item.split("$")
+            if len(parts) < 5:
+                continue
+            poi_name = parts[3].strip() if len(parts) > 3 else ""
+            city = (parts[0] or (parts[5] if len(parts) > 5 else "")).strip()
+            if city in allowed and poi_name:
+                candidates.append(PoiCandidate(city, poi_name, rank, query_text))
+        if candidates:
+            return candidates
+        time.sleep(0.2)
+    return []
 
 
 def _search_baidu_map(shop_name, timeout=10, restrict_cities=None):
-    """第二层：百度地图搜索建议接口
+    """Compatibility wrapper for callers that only need candidate cities."""
+    return {
+        candidate.city
+        for candidate in _search_baidu_candidates(
+            shop_name, timeout=timeout, restrict_cities=restrict_cities)
+    }
 
-    改进策略：
-    1. 去掉括号及内容后搜索短名（带括号的全名百度搜不到）
-    2. 如果无结果，逐步缩短关键词再搜（去掉通用后缀 -> 取前4字 -> 取前3字）
-    3. 只返回目标省份（粤桂琼黔滇）的城市，过滤无关结果
-    4. 若指定 restrict_cities（如{"贵阳市","遵义市"}），只返回这些城市的结果
 
-    Args:
-        restrict_cities: set/None 限定返回的城市集合（如用户选定区域后）
-    """
-    cleaned = _clean_shop_name(shop_name)
-
-    # 允许的城市集合：restrict_cities 优先，否则用全部 VALID_CITIES
-    allowed = restrict_cities if restrict_cities else VALID_CITIES
-
-    # 生成搜索词列表：清理后名 -> 逐步缩短
-    queries = [cleaned]
-    if len(cleaned) > 6:
-        # 去掉末尾的通用后缀
-        short = re.sub(r'(超市|便利店|便利|百货|商行|量贩|精品|综合).*$', '', cleaned)
-        if short and short != cleaned:
-            queries.append(short)
-        if len(short) > 4:
-            queries.append(short[:4])
-        if len(short) > 3:
-            queries.append(short[:3])
-
-    for q in queries:
-        if not q or len(q) < 2:
-            continue
-        query = urllib.parse.quote(q)
-        url = f"https://map.baidu.com/su?wd={query}&cid=1&type=0&newmap=1&from=webmap&prod=0"
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Referer": "https://map.baidu.com/",
-        })
-        try:
-            resp = urllib.request.urlopen(req, timeout=timeout)
-            raw = resp.read().decode("utf-8", errors="ignore")
-            data = json.loads(raw)
-            cities = set()
-            if 's' in data:
-                for item in data['s'][:10]:
-                    parts = item.split('$')
-                    if len(parts) >= 5:
-                        name = parts[3] if len(parts) > 3 else ''
-                        city = parts[0] if parts[0] else (parts[5] if len(parts) > 5 else '')
-                        # 只接受允许城市集合内的结果
-                        if city in allowed and name:
-                            cities.add(city)
-            if cities:
-                return cities
-        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError) as e:
-            logger.warning("百度地图搜索失败 (query=%s): %s", q, e)
-            continue
-        time.sleep(0.2)
-
-    return set()
+def _extract_branch(shop_name):
+    """Extract a parenthesized branch name, or use the full name as fallback."""
+    matched = re.search(r'[（(](.+?)[）)]', shop_name or "")
+    return matched.group(1) if matched else (shop_name or "")
 
 
 def _infer_from_branch(shop_name):
-    """第三层：从分店名关键词推断城市"""
-    m = re.search(r'[（(](.+?)[）)]', shop_name)
-    if not m:
-        # 没有括号，用整个店名匹配
-        branch = shop_name
-    else:
-        branch = m.group(1)
+    """Return all cities supported by branch-name keyword evidence."""
+    branch = _extract_branch(shop_name)
+    return {
+        city for keyword, city in BRANCH_KEYWORD_MAP.items() if keyword in branch
+    }
 
-    cities = set()
+
+def _comparison_text(value):
+    """Normalize text for a conservative, punctuation-insensitive comparison."""
+    return re.sub(r"[^\w\u4e00-\u9fff]", "", value or "").lower()
+
+
+def _city_name_evidence(shop_name, allowed):
+    """Score explicit city mentions without treating road names as conclusive."""
+    scores = {}
+    text = shop_name or ""
+    for key, city in CITY_KEYS.items():
+        if city not in allowed or key not in text:
+            continue
+        if city in text or re.search(
+                re.escape(key) + r"(?:店|站|仓|分店|区域)", text):
+            score = 100
+            label = f"店名明确出现“{key}”"
+        else:
+            # For example, "广州路" may be a road in another city.
+            score = 35
+            label = f"店名包含城市词“{key}”（可能是道路名）"
+        if score > scores.get(city, (0, ""))[0]:
+            scores[city] = (score, label)
+    return scores
+
+
+def _branch_evidence(shop_name, allowed):
+    """Score the longest matching branch keyword for every allowed city."""
+    branch = _extract_branch(shop_name)
+    matches = {}
     for keyword, city in BRANCH_KEYWORD_MAP.items():
-        if keyword in branch:
-            cities.add(city)
-    return cities
+        if city in allowed and keyword in branch:
+            existing = matches.get(city, "")
+            if len(keyword) > len(existing):
+                matches[city] = keyword
+    return {
+        city: (70 + min(len(keyword) * 8, 40), f"分店关键词“{keyword}”")
+        for city, keyword in matches.items()
+    }
+
+
+def _score_poi_candidate(shop_name, candidate):
+    """Score a POI candidate using its name, branch text, rank and query."""
+    shop_text = _comparison_text(shop_name)
+    poi_text = _comparison_text(candidate.poi_name)
+    branch_text = _comparison_text(_extract_branch(shop_name))
+    base_text = _comparison_text(_clean_shop_name(shop_name))
+    score = max(0, 15 - candidate.rank * 2)
+    evidence = [f"地图第 {candidate.rank + 1} 条"]
+
+    full_query = _compact_shop_name(shop_name)
+    if candidate.query == full_query:
+        score += 10
+        evidence.append("完整店名搜索")
+
+    similarity = SequenceMatcher(None, shop_text, poi_text).ratio()
+    if shop_text and (shop_text in poi_text or poi_text in shop_text):
+        score += 55
+        evidence.append("店名与 POI 完整匹配")
+    elif similarity >= 0.90:
+        score += 50
+        evidence.append("店名与 POI 高度相似")
+    elif similarity >= 0.78:
+        score += 32
+        evidence.append("店名与 POI 相似")
+    elif similarity >= 0.62:
+        score += 16
+
+    if branch_text and len(branch_text) >= 2 and branch_text in poi_text:
+        score += 38
+        evidence.append("POI 包含分店名")
+    elif base_text and len(base_text) >= 4 and (
+            base_text in poi_text or poi_text in base_text):
+        score += 20
+        evidence.append("POI 包含店铺主名称")
+    return score, evidence
+
+
+def _make_decision(shop_name, allowed, poi_candidates):
+    """Build a city decision from scored local text and map POI evidence."""
+    score_parts = {}
+    evidence_by_city = {}
+    poi_by_city = {}
+
+    def add_evidence(city, score, label):
+        score_parts.setdefault(city, []).append(score)
+        evidence_by_city.setdefault(city, []).append(label)
+
+    for city, (score, label) in _city_name_evidence(shop_name, allowed).items():
+        add_evidence(city, score, label)
+    for city, (score, label) in _branch_evidence(shop_name, allowed).items():
+        add_evidence(city, score, label)
+
+    poi_scores = {}
+    poi_evidence = {}
+    for candidate in poi_candidates:
+        if candidate.city not in allowed:
+            continue
+        score, evidence = _score_poi_candidate(shop_name, candidate)
+        if score > poi_scores.get(candidate.city, -1):
+            poi_scores[candidate.city] = score
+            poi_evidence[candidate.city] = evidence
+        poi_by_city.setdefault(candidate.city, []).append(candidate.poi_name)
+
+    for city, score in poi_scores.items():
+        add_evidence(city, score, "；".join(poi_evidence[city]))
+
+    candidates = []
+    for city, scores in score_parts.items():
+        candidates.append(CityCandidate(
+            city=city,
+            score=sum(scores),
+            evidence=tuple(evidence_by_city[city]),
+            poi_names=tuple(dict.fromkeys(poi_by_city.get(city, []))),
+        ))
+    candidates.sort(key=lambda item: (-item.score, item.city))
+    ordered = tuple(candidates)
+    if not ordered:
+        return CityDecision("", 0.0, False, "未找到可用的城市候选", ordered)
+
+    top = ordered[0]
+    second_score = ordered[1].score if len(ordered) > 1 else 0
+    score_gap = top.score - second_score
+    confidence = min(0.99, top.score / 150.0)
+    auto_accept = top.score >= 85 and score_gap >= 25
+    if auto_accept:
+        reason = f"证据得分 {top.score}，领先次优候选 {score_gap} 分"
+    elif len(ordered) > 1 and score_gap < 25:
+        reason = f"候选城市分差仅 {score_gap} 分，需要人工确认"
+    else:
+        reason = f"证据得分 {top.score}，不足以自动填入"
+    return CityDecision(top.city, confidence, auto_accept, reason, ordered)
+
+
+def _local_city_decision(city):
+    """Return an always-approved decision for a confirmed local record."""
+    candidate = CityCandidate(city, 200, ("本地人工确认知识库",), ())
+    return CityDecision(city, 1.0, True, "命中本地人工确认知识库", (candidate,))
+
+
+def _detect_city_decision(shop_name, allowed, use_network=True):
+    """Implement conservative detection for a validated city scope."""
+    if not shop_name or not allowed:
+        return CityDecision("", 0.0, False, "店铺名或城市范围为空", ())
+
+    cached = _lookup_learned_city(shop_name)
+    if cached and cached in allowed:
+        return _local_city_decision(cached)
+
+    poi_candidates = []
+    if use_network:
+        poi_candidates = _search_baidu_candidates(
+            shop_name, restrict_cities=allowed)
+    return _make_decision(shop_name, allowed, poi_candidates)
+
+
+def detect_city_decision(shop_name, use_network=True):
+    """Return a conservative decision across all supported cities."""
+    return _detect_city_decision(shop_name, set(VALID_CITIES), use_network)
 
 
 def detect_city(shop_name, use_network=True):
-    """
-    综合城市识别
-
-    Args:
-        shop_name: 店铺名称
-        use_network: 是否使用网络搜索（百度地图）
-
-    Returns:
-        str: 城市名（如"南宁市"），无法识别返回空字符串
-
-    识别顺序：
-        L0: 本地数据库查询（历史识别记录，零网络请求）
-        L1: 店名直接含城市名（如"三亚昌运超市"）
-        L3: 分店名关键词映射（如"美垦"->海口、"胜利路"->三亚）
-        L2: 百度地图搜索（去掉括号搜短名，逐步缩短）
-
-    识别成功后自动写入本地数据库，下次直接 L0 命中。
-    """
-    if not shop_name:
-        return ""
-
-    # 第0层：本地数据库查询（最快，零网络请求）
-    cached = _lookup_learned_city(shop_name)
-    if cached:
-        return cached
-
-    # 第一层：店名直接含城市名
-    cities = _extract_city_from_name(shop_name)
-    if cities:
-        city = sorted(cities)[0]
-        
-        return city
-
-    # 第三层：分店名关键词推断（优先于百度，因为路名/地标更精确）
-    cities = _infer_from_branch(shop_name)
-    if cities:
-        city = sorted(cities)[0]
-        
-        return city
-
-    # 第二层：百度地图搜索
-    if use_network:
-        cities = _search_baidu_map(shop_name)
-        if cities:
-            city = sorted(cities)[0]
-            
-            return city
-
-    return ""
+    """Return a city only when the evidence is strong enough to auto-fill."""
+    decision = detect_city_decision(shop_name, use_network)
+    return decision.city if decision.auto_accept else ""
 
 
 def detect_city_batch(shop_names, use_network=True, delay=0.3):
@@ -349,56 +536,16 @@ def detect_city_batch(shop_names, use_network=True, delay=0.3):
     return results
 
 
+def detect_city_decision_in_region(shop_name, restrict_cities, use_network=True):
+    """Return an evidence-based city decision within selected cities only."""
+    allowed = set(restrict_cities or ())
+    return _detect_city_decision(shop_name, allowed, use_network)
+
+
 def detect_city_in_region(shop_name, restrict_cities):
-    """在指定城市集合内联网识别店铺所在城市
-
-    Args:
-        shop_name: 店铺名
-        restrict_cities: set 城市集合（如 {"贵阳市","遵义市"} ）
-
-    Returns:
-        str: 城市名（如"贵阳市"），无法识别返回空字符串
-
-    识别顺序：
-        L0: 本地数据库查询（仅当缓存城市在 restrict_cities 内时才采用）
-        L1: 店名直接含城市名（且在 restrict_cities 内）
-        L3: 分店名关键词映射（且在 restrict_cities 内）
-        L2: 百度地图搜索（限定 restrict_cities）
-    """
-    if not shop_name:
-        return ""
-
-    # L0: 本地数据库（仅当缓存城市在限定区域内时才采用）
-    cached = _lookup_learned_city(shop_name)
-    if cached and cached in restrict_cities:
-        return cached
-
-    # L1: 店名含城市名（限定范围内）
-    cities = _extract_city_from_name(shop_name)
-    if cities:
-        in_range = [c for c in cities if c in restrict_cities]
-        if in_range:
-            city = sorted(in_range)[0]
-            
-            return city
-
-    # L3: 分店名关键词（限定范围内）
-    cities = _infer_from_branch(shop_name)
-    if cities:
-        in_range = [c for c in cities if c in restrict_cities]
-        if in_range:
-            city = sorted(in_range)[0]
-            
-            return city
-
-    # L2: 百度搜索（限定城市集合）
-    cities = _search_baidu_map(shop_name, restrict_cities=restrict_cities)
-    if cities:
-        city = sorted(cities)[0]
-        
-        return city
-
-    return ""
+    """Return an in-range city only when it is safe to fill automatically."""
+    decision = detect_city_decision_in_region(shop_name, restrict_cities)
+    return decision.city if decision.auto_accept else ""
 
 
 def detect_city_batch_in_region(shop_names, restrict_cities, delay=0.3):
@@ -415,15 +562,14 @@ def detect_city_batch_in_region(shop_names, restrict_cities, delay=0.3):
     results = {}
 
     # 先批量查本地数据库（数据库命中的直接用，不再走联网）
-    cached = _batch_lookup_learned(shop_names)
-    for name, city in cached.items():
-        results[name] = city
+    cached = batch_lookup_local_cities(shop_names, restrict_cities)
+    results.update(cached)
 
     # 未命中的走限定区域联网识别
     pending = [n for n in shop_names if n and n not in results]
     for name in pending:
         city = detect_city_in_region(name, restrict_cities)
-        if city:
+        if city in set(restrict_cities or ()):
             results[name] = city
         time.sleep(delay)
     return results

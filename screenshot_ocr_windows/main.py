@@ -1,8 +1,8 @@
 """
-美团截图 OCR 自动填表系统 - PyQt5 桌面 GUI
+即时零售截图价格核查 - PyQt5 桌面 GUI
 
 使用流程：
-  1. 导入美团截图（拖拽/选择/压缩包）
+  1. 导入即时零售截图（拖拽/选择/压缩包）
   2. 点击"开始识别" -> macOS Vision OCR + 字段解析
   3. 在表格中预览/修正识别结果
      - 可直接编辑每行的"所属区域"
@@ -14,6 +14,7 @@
 
 import os
 import logging
+import re
 import sys
 import tempfile
 import threading
@@ -159,9 +160,13 @@ class OCRWorker(QThread):
                 progress_callback=on_done,
                 should_cancel=self._cancel_event.is_set,
             )
-        except Exception:
+        except Exception as exc:
+            # RapidOCR/onnxruntime 初始化失败时仍要发出完成信号，
+            # 否则主窗口会永久停留在“识别中”且无法重试。
             logger.exception("ocr_batch_failed images=%d", len(self.image_paths))
-            raise
+            ocr_map = {
+                path: {"error": str(exc)} for path in self.image_paths
+            }
 
         retry_paths = []
         for path in self.image_paths:
@@ -850,6 +855,96 @@ class ProductSelectDialog(QDialog):
         return self._product_type
 
 
+class SpecCompletionDialog(QDialog):
+    """产品规格补齐对话框
+
+    产品规格无法从截图可靠识别（数量走默认回退）时弹出，
+    让用户从 6/12 听/瓶 中选择正确规格并回写表格。
+    """
+
+    # (选项值, 显示文本)；值为空表示维持默认
+    SPEC_OPTIONS = [
+        ("", "维持默认（保留待核对）"),
+        ("500ml*6听", "500ml*6听"),
+        ("500ml*6瓶", "500ml*6瓶"),
+        ("500ml*12听", "500ml*12听"),
+        ("500ml*12瓶", "500ml*12瓶"),
+    ]
+
+    def __init__(self, rows, parent=None):
+        """Args:
+            rows: list[(path, shop_name, product_name)] 规格存疑的记录
+        """
+        super().__init__(parent)
+        self.setWindowTitle("产品规格补齐")
+        self.setModal(True)
+        self.setMinimumSize(600, 320)
+        self._combos = {}  # path -> QComboBox
+
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(
+            f"以下 {len(rows)} 条记录的产品规格无法从截图可靠识别"
+            f"（当前为默认值），请选择正确规格："
+        )
+        hint.setStyleSheet("font-size: 13px; color: #333; padding: 6px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        from PyQt5.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        col_layout = QVBoxLayout(content)
+        for path, shop, product in rows:
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            label = QLabel(f"{shop}\n{product}")
+            label.setStyleSheet("font-size: 12px; color: #444; padding: 4px;")
+            label.setWordWrap(True)
+            label.setMinimumWidth(300)
+            combo = QComboBox()
+            for value, text in self.SPEC_OPTIONS:
+                combo.addItem(text, value)
+            combo.setMinimumWidth(170)
+            row_layout.addWidget(label, 1)
+            row_layout.addWidget(combo)
+            col_layout.addWidget(row_widget)
+            self._combos[path] = combo
+        col_layout.addStretch()
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.button(QDialogButtonBox.Ok).setText("确定")
+        btn_box.button(QDialogButtonBox.Cancel).setText("暂不处理")
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def get_choices(self):
+        """返回 {path: spec}；spec 为空表示用户选择维持默认。"""
+        return {
+            path: combo.currentData()
+            for path, combo in self._combos.items()
+            if combo.currentData()
+        }
+
+
+def _replace_product_spec(product_name, selected_spec):
+    """Replace the complete inferred package spec without duplicating capacity."""
+    if not selected_spec:
+        return product_name
+    updated, count = re.subn(
+        r"\d+\s*(?:ml|m[l1]|L)\s*\*\s*\d+\s*(?:瓶|听)",
+        selected_spec,
+        product_name or "",
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return updated if count else (product_name or "")
+
+
 class DuplicateReviewDialog(QDialog):
     """重复核查对话框
 
@@ -1054,7 +1149,7 @@ class MainWindow(QWidget):
         layout = QVBoxLayout(self)
 
         # ========== 顶部：图片导入 ==========
-        img_group = QGroupBox("① 导入美团截图")
+        img_group = QGroupBox("① 导入即时零售截图")
         img_layout = QVBoxLayout(img_group)
 
         self.drop_area = DropArea(self._on_files_added, self._paste_from_clipboard)
@@ -1545,7 +1640,7 @@ class MainWindow(QWidget):
 
     def _select_files(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "选择美团截图", "",
+            self, "选择即时零售截图", "",
             "图片文件 (*.png *.jpg *.jpeg *.webp)"
         )
         if files:
@@ -1621,7 +1716,7 @@ class MainWindow(QWidget):
     def _start_ocr(self, retry=False):
         image_paths = self._retry_paths if retry else self.image_paths
         if not image_paths:
-            QMessageBox.warning(self, "提示", "请先导入美团截图")
+            QMessageBox.warning(self, "提示", "请先导入即时零售截图")
             return
 
         self._ocr_is_retry = retry
@@ -1686,6 +1781,10 @@ class MainWindow(QWidget):
         self._refresh_review_state()
         if is_retry or cancelled:
             return
+
+        # 规格无法可靠识别的行弹窗补齐（6/12 听/瓶），确认后回写表格
+        self._prompt_spec_completion()
+
         self.status_label.setText(f"识别完成，共 {len(results)} 条结果，正在识别城市...")
 
         # 先让用户选择省份+城市，限定数据库匹配范围（更精准，避免跨城误匹配）
@@ -1948,6 +2047,47 @@ class MainWindow(QWidget):
                     self.table.setItem(row_idx, col, item)
 
         self.table.resizeRowsToContents()
+        self._refresh_review_state()
+
+    def _prompt_spec_completion(self):
+        """规格无法可靠识别的行弹窗补齐（500ml*6/12 听/瓶）。
+
+        用户选择具体规格后回写产品名并清除存疑标记；
+        选「维持默认」保留待核对标记，由用户手动处理。
+        """
+        rows = [
+            (path, fields.shop_name, fields.product_name)
+            for path, fields in self.ocr_results.items()
+            if getattr(fields, "spec_unreliable", False)
+        ]
+        if not rows:
+            return
+
+        dialog = SpecCompletionDialog(rows, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        choices = dialog.get_choices()  # {path: "500ml*6听"}；维持默认的 key 不存在
+
+        # 用缩略图列的图片路径定位表格行（范式见 _update_retry_rows）
+        rows_by_path = {}
+        for row in range(self.table.rowCount()):
+            image_item = self.table.item(row, len(TABLE_COLUMNS))
+            if image_item:
+                rows_by_path[image_item.data(Qt.UserRole)] = row
+
+        for path, spec in choices.items():
+            row = rows_by_path.get(path)
+            if row is None:
+                continue
+            # 替换完整规格，避免把容量重复拼接：燕京U8 500ml*12瓶 -> 500ml*6听
+            name_item = self.table.item(row, 4)  # E列=产品名称
+            if name_item and spec:
+                name_item.setText(_replace_product_spec(name_item.text(), spec))
+            # 已确认规格，清除存疑标记（备注中的提示一并移除）
+            remark_item = self.table.item(row, 13)  # P列=备注
+            if remark_item:
+                cleaned = remark_item.text().replace("产品规格需人工确认", "").strip("；")
+                remark_item.setText(cleaned)
         self._refresh_review_state()
 
     def _populate_table(self):

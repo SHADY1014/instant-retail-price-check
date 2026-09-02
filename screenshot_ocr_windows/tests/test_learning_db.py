@@ -22,12 +22,9 @@ os.environ["OCR_LEARNING_DB"] = TEST_DB
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# This is an executable regression script rather than a unittest module.
-# Avoid opening a database merely because ``unittest discover`` imports it.
-if __name__ == "__main__":
-    import database
-    from database.matcher import normalize, match
-    from database import importer
+import database
+from database.matcher import normalize, match
+from database import importer
 
 PASS = 0
 FAIL = 0

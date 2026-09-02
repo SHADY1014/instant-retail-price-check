@@ -9,6 +9,7 @@
 .pytest_cache/
 **/.pytest_cache/
 **/.Codex/
+.zcode/
 
 # Generated application data and reports
 /output/

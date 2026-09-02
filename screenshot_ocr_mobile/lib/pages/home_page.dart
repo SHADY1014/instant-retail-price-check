@@ -79,14 +79,17 @@ class _HomePageState extends State<HomePage> {
       final tempDir = await _saveToTemp(files);
 
       if (!mounted) return;
-      await _showCitySelectDialog();
+      // null 表示用户取消了范围选择；这时禁止自动城市匹配，避免
+      // 同名店铺按全量城市命中到错误城市。选择“全量匹配”会返回空集，
+      // 但仍视为用户明确确认，保留原有全量行为。
+      final citySelectionConfirmed = await _showCitySelectDialog();
       setState(() {
         _results = [];
         _failedImagePaths.clear();
         _showUnmatchedOnly = false;
         _showReviewOnly = false;
       });
-      await _runOcr(tempDir);
+      await _runOcr(tempDir, autoDetectCities: citySelectionConfirmed);
     } catch (e) {
       _showSnack('导入图片失败: $e');
     }
@@ -108,17 +111,21 @@ class _HomePageState extends State<HomePage> {
   // =========================================================
   // 省份+城市多选对话框
   // =========================================================
-  Future<void> _showCitySelectDialog() async {
+  Future<bool> _showCitySelectDialog() async {
     final selected = await showDialog<Set<String>>(
       context: context,
       builder: (ctx) => _CitySelectDialog(),
     );
-    // 返回 null = 取消（保留原选择）；返回空集 = 全量匹配
+    if (!mounted) return false;
+    // 返回 null = 取消；返回空集 = 用户明确选择“全量匹配”。
     if (selected != null) {
       setState(() {
         _restrictCities = selected;
       });
     }
+    // 如果之前已有范围，取消本次选择时可以继续沿用该范围；首次使用
+    // 且没有范围时必须跳过自动匹配。
+    return selected != null || _restrictCities.isNotEmpty;
   }
 
   // =========================================================
@@ -173,7 +180,11 @@ class _HomePageState extends State<HomePage> {
   // =========================================================
   // OCR 识别
   // =========================================================
-  Future<void> _runOcr(List<String> imagePaths, {bool retry = false}) async {
+  Future<void> _runOcr(
+    List<String> imagePaths, {
+    bool retry = false,
+    bool autoDetectCities = true,
+  }) async {
     setState(() {
       _isOcrRunning = true;
       _status = '开始识别...';
@@ -236,8 +247,18 @@ class _HomePageState extends State<HomePage> {
             ? '识别已取消，可继续重试'
             : '识别完成：成功 ${results.length - failedInRun} 条，失败 $failedInRun 条';
       });
-      if (!retry && !_cancelOcrRequested && results.isNotEmpty) {
+      if (!retry &&
+          !_cancelOcrRequested &&
+          results.isNotEmpty &&
+          autoDetectCities) {
         await _detectCities();
+      } else if (!retry &&
+          !_cancelOcrRequested &&
+          results.isNotEmpty &&
+          mounted) {
+        setState(() {
+          _status = '识别完成：城市暂未匹配，可点击“重新识别城市”处理';
+        });
       }
       if (mounted && _results.isEmpty) {
         setState(() => _status = '未识别到数据');

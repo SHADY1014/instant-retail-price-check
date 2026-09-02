@@ -9,6 +9,9 @@ List<String> reviewIssues(FormFields fields) {
     return const ['OCR 识别失败'];
   }
   final issues = <String>[];
+  if (remark.contains('产品规格需人工确认')) {
+    issues.add('产品规格需人工确认');
+  }
   if (fields.region.trim().isEmpty) issues.add('未确认所属区域');
   if (fields.shopName.trim().isEmpty) issues.add('未识别店铺名称');
   if (fields.productName.trim().isEmpty) issues.add('未识别产品名称');

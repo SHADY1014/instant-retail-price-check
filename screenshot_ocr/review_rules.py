@@ -25,6 +25,10 @@ def find_review_issues(record: Mapping[str, object]) -> list[str]:
         return ["OCR 识别失败"]
 
     issues = []
+    # 产品规格无法从截图可靠识别（数量走默认回退），需人工确认
+    if "产品规格需人工确认" in remark:
+        issues.append("产品规格需人工确认")
+
     required_fields = (
         ("region", "未确认所属区域"),
         ("shop_name", "未识别店铺名称"),
