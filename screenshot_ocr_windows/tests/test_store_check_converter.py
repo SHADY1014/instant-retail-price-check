@@ -11,6 +11,7 @@ from store_check_converter import (  # noqa: E402
     SourceRecord,
     convert_inspection_to_store_check,
     extract_spec,
+    filter_u8_records,
     merge_records,
     normalize_shop_name,
     parse_source_workbook,
@@ -80,6 +81,26 @@ class StoreCheckConverterTest(unittest.TestCase):
         rows, pending, _ = merge_records(records)
         self.assertFalse(pending)
         self.assertEqual(len(rows), 2)
+
+    def test_conversion_scope_is_u8_only(self):
+        base = dict(
+            row_number=1,
+            region="昆明市",
+            shop_name="测试门店（南亚店）",
+            platform="美团闪购",
+            spec="500ml*6瓶",
+            final_price=30,
+            theory_price=30,
+            shop_key="测试门店|南亚",
+            display_name="测试门店（南亚店）",
+        )
+        u8 = SourceRecord(product_name="燕京U8 500ml*6瓶", **base)
+        other = SourceRecord(
+            product_name="漓泉1998 500ml*6瓶", row_number=2, **{k: v for k, v in base.items() if k != "row_number"}
+        )
+        kept, skipped = filter_u8_records([u8, other])
+        self.assertEqual(kept, [u8])
+        self.assertEqual(len(skipped), 1)
 
     def test_1998_province_thresholds(self):
         self.assertEqual(

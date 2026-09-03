@@ -220,6 +220,12 @@ def _product_type(product_name: str) -> str:
     return ""
 
 
+def is_u8_product(product_name: str) -> bool:
+    """判断产品是否为本转换功能支持的燕京 U8。"""
+    text = str(product_name or "").lower()
+    return "u8" in text or "燕京u8" in text
+
+
 def threshold_for(
     product_name: str,
     spec: str,
@@ -347,6 +353,23 @@ def parse_source_workbook(xlsx_path: str) -> tuple[list[SourceRecord], list[str]
     if not records:
         raise ValueError("未读取到有效的巡查表数据")
     return records, warnings
+
+
+def filter_u8_records(
+    records: Iterable[SourceRecord],
+) -> tuple[list[SourceRecord], list[str]]:
+    """仅保留燕京 U8 和无售卖记录，并报告被跳过的产品行。"""
+    kept: list[SourceRecord] = []
+    skipped: list[str] = []
+    for record in records:
+        if record.is_no_sale or is_u8_product(record.product_name):
+            kept.append(record)
+        else:
+            skipped.append(
+                f"已跳过非燕京U8记录：第{record.row_number}行 "
+                f"{record.shop_name} / {record.product_name}"
+            )
+    return kept, skipped
 
 
 def merge_records(
@@ -734,13 +757,16 @@ def convert_inspection_to_store_check(
 ) -> ConversionResult:
     """将一张巡查表转换为一张门店价格检查表。"""
     records, parse_warnings = parse_source_workbook(input_path)
+    records, product_warnings = filter_u8_records(records)
+    if not records:
+        raise ValueError("源巡查表中未找到燕京U8记录，无法生成门店价格检查表")
     rows, pending, logs = merge_records(
         records,
         shop_name_mapping=shop_name_mapping,
         no_sale_text=no_sale_text,
         thresholds=thresholds,
     )
-    pending = parse_warnings + pending
+    pending = parse_warnings + product_warnings + pending
     if output_dir is None:
         output_dir = os.path.dirname(os.path.abspath(input_path))
     os.makedirs(output_dir, exist_ok=True)
@@ -778,6 +804,8 @@ __all__ = [
     "convert_inspection_to_store_check",
     "convert巡查表到门店价格检查表",
     "extract_spec",
+    "filter_u8_records",
+    "is_u8_product",
     "merge_records",
     "normalize_shop_name",
     "parse_source_workbook",
