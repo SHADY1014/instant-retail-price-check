@@ -1324,7 +1324,7 @@ class MainWindow(QWidget):
 
         self.store_check_btn = QPushButton("🧾 U8门店检查表")
         self.store_check_btn.setToolTip(
-            "仅把燕京U8巡查表转换为总部供货渠道门店价格检查表（12列）"
+            "仅把燕京U8巡查表转换为总部供货渠道价格明细（含城市列，共13列）"
         )
         self.store_check_btn.clicked.connect(self._convert_store_check)
         export_layout.addWidget(self.store_check_btn)
@@ -2652,7 +2652,7 @@ class MainWindow(QWidget):
             QMessageBox.critical(self, "导出失败", str(e))
 
     def _convert_store_check(self):
-        """把巡查表转换为总部供货渠道门店价格检查表。"""
+        """把巡查表转换为总部供货渠道价格明细。"""
         default_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output"
         )
@@ -2667,7 +2667,7 @@ class MainWindow(QWidget):
         if not file_path:
             return
         output_dir = os.path.dirname(file_path)
-        self.status_label.setText("正在转换燕京U8门店价格检查表...")
+        self.status_label.setText("正在生成燕京U8总部供货渠道价格明细...")
         QApplication.processEvents()
         try:
             result = store_check_converter.convert_inspection_to_store_check(
@@ -2682,11 +2682,11 @@ class MainWindow(QWidget):
             QMessageBox.information(
                 self,
                 "转换成功",
-                f"已生成 {len(result.rows)} 行燕京U8门店价格检查表：\n"
+                f"已生成 {len(result.rows)} 行总部供货渠道价格明细：\n"
                 f"{result.output_path}{pending_text}",
             )
             self.status_label.setText(
-                f"门店价格检查表已生成：{os.path.basename(result.output_path)}"
+                f"总部供货渠道价格明细已生成：{os.path.basename(result.output_path)}"
             )
         except Exception as exc:
             logger.exception("store_check_conversion_failed")

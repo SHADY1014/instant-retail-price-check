@@ -1,4 +1,4 @@
-"""巡查表转换为总部供货渠道门店价格检查表。
+"""巡查表转换为总部供货渠道价格明细。
 
 这个模块刻意不依赖 Qt。解析、店名归一化、合并、判定和输出均通过
 小而稳定的函数完成，macOS 和 Windows 桌面端可以直接共用同一套规则。
@@ -24,7 +24,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, Side
 
 
-CONVERTER_VERSION = "1.0.0"
+CONVERTER_VERSION = "1.1.0"
 PLATFORMS = ("美团闪购", "淘宝闪购", "京东秒送")
 SOURCE_PLATFORM_ALIASES = {
     "美团": "美团闪购",
@@ -101,6 +101,7 @@ class StoreCheckRow:
     shop_key: str = ""
     spec: str = ""
     threshold: Optional[float] = None
+    city: str = ""
 
 
 @dataclass
@@ -209,6 +210,12 @@ def _province_from_region(region: str) -> str:
         if city in text:
             return province
     return ""
+
+
+def _region_key(region: str) -> str:
+    """返回用于分组的稳定区域键，避免同名片区跨城市误合并。"""
+    text = re.sub(r"\s+", "", str(region or "")).strip()
+    return text[:-1] if text.endswith("市") else text
 
 
 def _product_type(product_name: str) -> str:
@@ -379,19 +386,13 @@ def merge_records(
     no_sale_text: str = DEFAULT_NO_SALE_TEXT,
     thresholds: Optional[Mapping[str, Mapping[int, float]]] = None,
 ) -> tuple[list[StoreCheckRow], list[str], list[str]]:
-    """按片区/规格/平台合并并重算违规状态。"""
+    """按城市、片区、规格和平台合并并重算违规状态。"""
     records = list(records)
     pending: list[str] = []
     logs: list[str] = []
     first_shop: OrderedDict[str, str] = OrderedDict()
-    first_region: dict[str, str] = {}
     for record in records:
         first_shop.setdefault(record.shop_key, record.display_name)
-        old_region = first_region.setdefault(record.shop_key, record.region)
-        if old_region and record.region and old_region != record.region:
-            pending.append(
-                f"片区 {record.shop_key} 出现多个区域：{old_region} / {record.region}"
-            )
     def display_for(key: str) -> str:
         if shop_name_mapping and key in shop_name_mapping:
             return str(shop_name_mapping[key])
@@ -401,16 +402,17 @@ def merge_records(
             return str(shop_name_mapping[area_key])
         return first_shop.get(key, key)
 
-    sold_groups: OrderedDict[tuple[str, str, str], dict[str, SourceRecord]] = (
+    sold_groups: OrderedDict[tuple[tuple[str, str], str, str], dict[str, SourceRecord]] = (
         OrderedDict()
     )
-    no_sale_groups: OrderedDict[str, dict[str, SourceRecord]] = OrderedDict()
+    no_sale_groups: OrderedDict[tuple[str, str], dict[str, SourceRecord]] = OrderedDict()
     for record in records:
+        location_key = (record.shop_key, _region_key(record.region))
         if record.is_no_sale:
-            no_sale_groups.setdefault(record.shop_key, {})[record.platform] = record
+            no_sale_groups.setdefault(location_key, {})[record.platform] = record
             continue
         group_key = (
-            record.shop_key,
+            location_key,
             _product_family(record.product_name, record.spec),
             record.spec,
         )
@@ -431,7 +433,7 @@ def merge_records(
                 f"{record.platform}（第{previous.row_number}行）"
             )
     rows: list[StoreCheckRow] = []
-    for (shop_key, _family, spec), by_platform in sold_groups.items():
+    for ((shop_key, _region), _family, spec), by_platform in sold_groups.items():
         first = next(iter(by_platform.values()))
         threshold = threshold_for(
             first.product_name, spec, first.region, thresholds
@@ -453,14 +455,19 @@ def merge_records(
                 shop_key=shop_key,
                 spec=spec,
                 threshold=threshold,
+                city=first.region,
             )
         )
         logs.append(
             f"合并片区={shop_key} 规格={spec} 平台数={len(by_platform)} 状态={status}"
         )
-    for shop_key, by_platform in no_sale_groups.items():
-        if any(row.shop_key == shop_key for row in rows):
+    for (shop_key, _region), by_platform in no_sale_groups.items():
+        if any(
+            row.shop_key == shop_key and _region_key(row.city) == _region
+            for row in rows
+        ):
             continue
+        first = next(iter(by_platform.values()))
         rows.append(
             StoreCheckRow(
                 shop_name=display_for(shop_key),
@@ -469,20 +476,23 @@ def merge_records(
                 platform_values={platform: by_platform.get(platform) for platform in PLATFORMS},
                 no_sale=True,
                 shop_key=shop_key,
+                city=first.region,
             )
         )
     shop_order = {
-        shop_key: min(
+        location_key: min(
             record.row_number
             for record in records
-            if record.shop_key == shop_key
+            if (record.shop_key, _region_key(record.region)) == location_key
         )
-        for shop_key in {item.shop_key for item in rows}
+        for location_key in {
+            (item.shop_key, _region_key(item.city)) for item in rows
+        }
     }
     rows.sort(
         key=lambda row: (
             row.no_sale,
-            shop_order.get(row.shop_key, 10**9),
+            shop_order.get((row.shop_key, _region_key(row.city)), 10**9),
             SPEC_ORDER.get(row.spec, 99),
         )
     )
@@ -497,29 +507,32 @@ def _thin_border() -> Border:
 def _build_output_workbook(rows: list[StoreCheckRow], input_path: str, pending: list[str], logs: list[str]) -> tuple[Workbook, list[tuple[str, int, int, bytes, str]]]:
     wb = Workbook()
     ws = wb.active
-    ws.title = "Sheet1"
+    ws.title = "总部供货渠道价格明细"
+    wb.properties.title = "总部供货渠道价格明细"
     ws.sheet_view.showGridLines = False
     ws.merge_cells("A1:A2")
     ws.merge_cells("B1:B2")
     ws.merge_cells("C1:C2")
-    ws.merge_cells("D1:F1")
-    ws.merge_cells("G1:I1")
-    ws.merge_cells("J1:L1")
+    ws.merge_cells("D1:D2")
+    ws.merge_cells("E1:G1")
+    ws.merge_cells("H1:J1")
+    ws.merge_cells("K1:M1")
     headers = [
-        ("A1", "门店"),
-        ("B1", "产品"),
-        ("C1", "是否违规"),
-        ("D1", "产品理论成交价格\n（产品成交价格-打包、配送费）"),
-        ("G1", "产品实际成交单价\n（最终付款价格）"),
-        ("J1", "图片"),
+        ("A1", "城市"),
+        ("B1", "门店"),
+        ("C1", "产品"),
+        ("D1", "是否违规"),
+        ("E1", "产品理论成交价格\n（产品成交价格-打包、配送费）"),
+        ("H1", "产品实际成交单价\n（最终付款价格）"),
+        ("K1", "图片"),
     ]
     for cell_ref, value in headers:
         ws[cell_ref] = value
-    for col, value in zip("DEF", PLATFORMS):
+    for col, value in zip("EFG", PLATFORMS):
         ws[f"{col}2"] = value
-    for col, value in zip("GHI", PLATFORMS):
+    for col, value in zip("HIJ", PLATFORMS):
         ws[f"{col}2"] = value
-    for col, value in zip("JKL", PLATFORMS):
+    for col, value in zip("KLM", PLATFORMS):
         ws[f"{col}2"] = value
     header_font = Font(name="微软雅黑", size=11, bold=True)
     data_font = Font(name="宋体", size=11, bold=True)
@@ -527,22 +540,22 @@ def _build_output_workbook(rows: list[StoreCheckRow], input_path: str, pending: 
     data_alignment = Alignment(horizontal="center", vertical="center")
     border = _thin_border()
     for row in range(1, 3):
-        for col in range(1, 13):
+        for col in range(1, 14):
             cell = ws.cell(row, col)
             cell.font = header_font
             cell.alignment = header_alignment
             cell.border = copy(border)
     ws.row_dimensions[1].height = 31
     ws.row_dimensions[2].height = 20
-    widths = {"A": 45, "B": 24.77, "C": 16.06, "J": 11.5}
-    for col in "DEFGHIKL":
+    widths = {"A": 13, "B": 45, "C": 24.77, "D": 16.06, "K": 11.5}
+    for col in "EFGHIJLM":
         widths.setdefault(col, 13)
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
     image_records: list[tuple[str, int, int, bytes, str]] = []
     for output_row, item in enumerate(rows, start=3):
         ws.row_dimensions[output_row].height = 20
-        values = [item.shop_name, item.product_name, item.status]
+        values = [item.city, item.shop_name, item.product_name, item.status]
         for col, value in enumerate(values, start=1):
             cell = ws.cell(output_row, col, value)
             cell.font = data_font
@@ -550,8 +563,8 @@ def _build_output_workbook(rows: list[StoreCheckRow], input_path: str, pending: 
             cell.border = copy(border)
         for offset, platform in enumerate(PLATFORMS):
             record = item.platform_values.get(platform)
-            theory_cell = ws.cell(output_row, 4 + offset)
-            actual_cell = ws.cell(output_row, 7 + offset)
+            theory_cell = ws.cell(output_row, 5 + offset)
+            actual_cell = ws.cell(output_row, 8 + offset)
             theory_cell.value = record.theory_price if record and record.theory_price is not None else "/"
             actual_cell.value = record.final_price if record and record.final_price is not None else "/"
             for cell in (theory_cell, actual_cell):
@@ -560,12 +573,12 @@ def _build_output_workbook(rows: list[StoreCheckRow], input_path: str, pending: 
                 cell.border = copy(border)
                 if isinstance(cell.value, (int, float)):
                     cell.number_format = "0.0#"
-            image_cell = ws.cell(output_row, 10 + offset)
+            image_cell = ws.cell(output_row, 11 + offset)
             if record and record.image_bytes:
                 placeholder = f"PH_{output_row}_{offset}"
                 image_cell.value = f'=_xlfn.DISPIMG("{placeholder}",1)'
                 image_records.append(
-                    ("Sheet1", output_row, 10 + offset, record.image_bytes, placeholder)
+                    (ws.title, output_row, 11 + offset, record.image_bytes, placeholder)
                 )
             else:
                 image_cell.value = "/"
@@ -593,8 +606,8 @@ def _build_output_workbook(rows: list[StoreCheckRow], input_path: str, pending: 
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
                 cell.border = copy(border)
     if rows:
-        ws.freeze_panes = "D3"
-        ws.auto_filter.ref = f"A2:L{len(rows) + 2}"
+        ws.freeze_panes = "E3"
+        ws.auto_filter.ref = f"A2:M{len(rows) + 2}"
     return wb, image_records
 
 
@@ -755,11 +768,11 @@ def convert_inspection_to_store_check(
     no_sale_text: str = DEFAULT_NO_SALE_TEXT,
     thresholds: Optional[Mapping[str, Mapping[int, float]]] = None,
 ) -> ConversionResult:
-    """将一张巡查表转换为一张门店价格检查表。"""
+    """将一张巡查表转换为一张总部供货渠道价格明细。"""
     records, parse_warnings = parse_source_workbook(input_path)
     records, product_warnings = filter_u8_records(records)
     if not records:
-        raise ValueError("源巡查表中未找到燕京U8记录，无法生成门店价格检查表")
+        raise ValueError("源巡查表中未找到燕京U8记录，无法生成总部供货渠道价格明细")
     rows, pending, logs = merge_records(
         records,
         shop_name_mapping=shop_name_mapping,
@@ -771,10 +784,9 @@ def convert_inspection_to_store_check(
         output_dir = os.path.dirname(os.path.abspath(input_path))
     os.makedirs(output_dir, exist_ok=True)
     if not output_name:
-        city = (records[0].region or "").replace("市", "") or "门店"
         date_match = re.search(r"(20\d{6})", os.path.basename(input_path))
         date_text = date_match.group(1) if date_match else datetime.now().strftime("%Y%m%d")
-        output_name = f"{city}门店价格检查表_{date_text}.xlsx"
+        output_name = f"总部供货渠道价格明细_{date_text}.xlsx"
     output_path = os.path.join(output_dir, output_name)
     workbook, image_records = _build_output_workbook(
         rows, input_path, pending, logs

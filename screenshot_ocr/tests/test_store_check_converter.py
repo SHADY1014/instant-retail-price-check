@@ -5,6 +5,8 @@ import tempfile
 import unittest
 import zipfile
 
+from openpyxl import load_workbook
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from store_check_converter import (  # noqa: E402
@@ -82,6 +84,28 @@ class StoreCheckConverterTest(unittest.TestCase):
         self.assertFalse(pending)
         self.assertEqual(len(rows), 2)
 
+    def test_same_shop_key_in_different_cities_stays_separate(self):
+        records = []
+        for row, city in enumerate(("昆明市", "贵阳市"), start=1):
+            records.append(
+                SourceRecord(
+                    row_number=row,
+                    region=city,
+                    shop_name="京东酒世界（中心店）",
+                    platform="美团闪购",
+                    product_name="燕京U8 500ml*6瓶",
+                    spec="500ml*6瓶",
+                    final_price=30,
+                    theory_price=30,
+                    shop_key="京东酒世界|中心",
+                    display_name="京东酒世界（中心店）",
+                )
+            )
+        rows, pending, _ = merge_records(records)
+        self.assertFalse(pending)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row.city for row in rows}, {"昆明市", "贵阳市"})
+
     def test_conversion_scope_is_u8_only(self):
         base = dict(
             row_number=1,
@@ -150,6 +174,37 @@ class StoreCheckConverterTest(unittest.TestCase):
                 for image_id in ids:
                     self.assertIn(image_id, cellimages)
                 self.assertNotIn("#REF!", sheet_xml)
+
+    def test_output_includes_city_column_and_hq_detail_name(self):
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        source = os.path.join(
+            root,
+            "output",
+            "巡查表_20260902_171538",
+            "价格巡查表_20260902_171538.xlsx",
+        )
+        with tempfile.TemporaryDirectory() as output_dir:
+            result = convert_inspection_to_store_check(source, output_dir=output_dir)
+            self.assertEqual(
+                os.path.basename(result.output_path),
+                "总部供货渠道价格明细_20260902.xlsx",
+            )
+            wb = load_workbook(result.output_path, data_only=False)
+            self.assertEqual(wb.properties.title, "总部供货渠道价格明细")
+            ws = wb["总部供货渠道价格明细"]
+            self.assertEqual(ws.max_column, 13)
+            self.assertEqual(
+                [ws.cell(1, column).value for column in range(1, 5)],
+                ["城市", "门店", "产品", "是否违规"],
+            )
+            self.assertEqual(ws.freeze_panes, "E3")
+            self.assertTrue(ws.auto_filter.ref.startswith("A2:M"))
+            cities = {
+                ws.cell(row, 1).value
+                for row in range(3, ws.max_row + 1)
+                if ws.cell(row, 1).value
+            }
+            self.assertTrue({"昆明市", "贵阳市", "遵义市"}.issubset(cities))
 
 
 if __name__ == "__main__":

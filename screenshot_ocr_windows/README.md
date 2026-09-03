@@ -77,7 +77,7 @@ screenshot_ocr_windows/
 ├── field_parser.py      ← OCR 文本 -> 表单字段解析器
 ├── excel_writer.py      ← Excel 写入器（模板格式 + 公式 + WPS 嵌入图片）
 ├── summary_generator.py ← 价格合格率汇总表生成器
-├── store_check_converter.py ← 巡查表 → 门店价格检查表转换器
+├── store_check_converter.py ← 巡查表 → 总部供货渠道价格明细转换器
 ├── summary_speech.py    ← 总结话术生成器
 ├── city_detector.py     ← 城市自动识别
 ├── city_pool.py         ← 城市池（广东/广西/海南/贵州/云南）
@@ -133,7 +133,7 @@ python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(); print('OCR eng
 5. **城市与重复核查**：按需使用联网识别城市、统一设置店铺城市和查重核查；联网结果会保留分店名与 POI 匹配证据，歧义项默认不填入，待人工确认后才会写入知识库。联网仅发送店铺名称，并在本地记录授权、请求范围、候选和最终裁决
 6. **导出 Excel**：导出前会提示待核对条数，确认后生成巡查表
 7. **生成汇总表/话术**：选择巡查表 xlsx 生成价格合格率汇总报告或总结话术
-8. **生成 U8 门店价格检查表**：点击「U8门店检查表」，选择巡查表 xlsx；仅转换燕京 U8，输出总部 12 列检查表及转换日志
+8. **生成总部供货渠道价格明细**：点击「U8门店检查表」，选择巡查表 xlsx；仅转换燕京 U8，输出含城市列的总部 13 列明细表及转换日志
 
 ### 1998 价格标准
 
