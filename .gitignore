@@ -14,6 +14,10 @@
 # Generated application data and reports
 /output/
 **/output/
+/*审计报告_*.md
+/*测试报告_*.md
+/*内部发行与更新方案.md
+/*巡查表转门店价格检查表_功能设计大纲.md
 **/data/ocr_learning.db
 **/data/*.db-wal
 **/data/*.db-shm
