@@ -65,6 +65,7 @@ from city_detector import (
 import summary_generator
 import summary_speech
 import excel_writer
+import store_check_converter
 
 logger = logging.getLogger(__name__)
 
@@ -453,7 +454,11 @@ class RegionNetworkWorker(QThread):
     """在指定城市集合内联网识别店铺城市（后台线程）"""
 
     progress = pyqtSignal(str)
+    # Keep the original one-argument signal for integrations that consume
+    # only the automatic map.  The UI uses ``finished_details`` so all
+    # worker-owned state arrives in one immutable snapshot.
     finished_cities = pyqtSignal(dict)
+    finished_details = pyqtSignal(object)
 
     def __init__(self, shop_names, restrict_cities):
         super().__init__()
@@ -461,10 +466,42 @@ class RegionNetworkWorker(QThread):
         self.restrict_cities = set(restrict_cities)
         self.review_decisions = {}
         self.network_shops = []
+        self._cancel_event = Event()
+
+    def cancel(self):
+        """Request cooperative cancellation between network lookups."""
+        self._cancel_event.set()
+
+    def _emit_finished(self, results=None, error=""):
+        """Emit a self-contained result payload for the main-thread callback."""
+        result_map = dict(results or {})
+        payload = {
+            "results": result_map,
+            "network_shops": tuple(self.network_shops),
+            "review_decisions": dict(self.review_decisions),
+            "restrict_cities": tuple(sorted(self.restrict_cities)),
+            "cancelled": self._cancel_event.is_set(),
+            "error": str(error or ""),
+        }
+        for signal, value, label in (
+                (self.finished_cities, result_map, "legacy"),
+                (self.finished_details, payload, "details")):
+            try:
+                signal.emit(value)
+            except Exception:
+                logger.exception(
+                    "region_city_result_emit_failed signal=%s", label)
 
     def run(self):
+        try:
+            self._run_impl()
+        except Exception as exc:
+            logger.exception("region_city_worker_failed")
+            self._emit_finished(error=exc)
+
+    def _run_impl(self):
         if not self.shop_names:
-            self.finished_cities.emit({})
+            self._emit_finished()
             return
 
         # 先批量查本地数据库。只接受所选范围内的 L1-L4 高可信命中；
@@ -483,6 +520,9 @@ class RegionNetworkWorker(QThread):
         # Only high-confidence decisions update the table in the background.
         # Ambiguous results are retained for one consolidated manual review.
         for i, name in enumerate(pending):
+            if self._cancel_event.is_set():
+                self._emit_finished(results)
+                return
             self.progress.emit(f"联网识别中: {name} ({i+1}/{len(pending)})")
             decision = detect_city_decision_in_region(
                 name, self.restrict_cities)
@@ -499,7 +539,7 @@ class RegionNetworkWorker(QThread):
                 )
             time.sleep(0.3)
 
-        self.finished_cities.emit(results)
+        self._emit_finished(results)
 
 
 class RegionSelectDialog(QDialog):
@@ -1120,6 +1160,8 @@ class MainWindow(QWidget):
         self._last_cities = set()  # 用户上次选的城市集合
         self._network_consent_at = self._load_network_consent()
         self._network_request_id = None
+        self._region_worker = None
+        self._network_running = False
 
         self.init_ui()
 
@@ -1280,6 +1322,13 @@ class MainWindow(QWidget):
         self.export_btn.clicked.connect(self._export_excel)
         export_layout.addWidget(self.export_btn)
 
+        self.store_check_btn = QPushButton("🧾 门店价格检查表")
+        self.store_check_btn.setToolTip(
+            "把已生成的巡查表转换为总部供货渠道门店价格检查表（12列）"
+        )
+        self.store_check_btn.clicked.connect(self._convert_store_check)
+        export_layout.addWidget(self.store_check_btn)
+
         export_layout.addStretch()
 
         report_menu = QMenu(self)
@@ -1305,7 +1354,7 @@ class MainWindow(QWidget):
             self.add_btn, self.zip_btn, self.paste_btn, self.clear_btn,
             self.ocr_btn, self.cancel_ocr_btn, self.retry_ocr_btn,
             self.net_city_btn, self.batch_city_btn, self.dedup_btn, self.export_btn,
-            report_tools, data_tools,
+            self.store_check_btn, report_tools, data_tools,
         ):
             button.setFixedHeight(32)
 
@@ -1329,6 +1378,14 @@ class MainWindow(QWidget):
 
     def _network_detect_city(self):
         """联网识别城市：用户先选省份+城市，再对未识别店铺在选定区域内联网搜索"""
+        try:
+            worker_running = bool(
+                self._region_worker and self._region_worker.isRunning())
+        except Exception:
+            worker_running = False
+        if self._network_running or worker_running:
+            QMessageBox.information(self, "提示", "联网识别正在进行，请稍候")
+            return
         if self.table.rowCount() == 0:
             QMessageBox.warning(self, "提示", "表格中没有数据，请先识别图片")
             return
@@ -1385,31 +1442,104 @@ class MainWindow(QWidget):
             return
 
         # 启动后台联网识别线程
-        self._region_worker = RegionNetworkWorker(sorted(unmatched), restrict_cities)
-        self._region_worker.progress.connect(
-            lambda msg: self.status_label.setText(msg)
+        worker = RegionNetworkWorker(sorted(unmatched), restrict_cities)
+        self._region_worker = worker
+        self._network_running = True
+        self.net_city_btn.setEnabled(False)
+        worker.progress.connect(
+            lambda msg, current=worker: self._on_region_progress(current, msg)
         )
-        self._region_worker.finished_cities.connect(self._on_region_cities_detected)
-        self._region_worker.start()
+        worker.finished_details.connect(
+            lambda payload, current=worker:
+            self._on_region_cities_detected(current, payload)
+        )
+        try:
+            worker.start()
+        except Exception as exc:
+            self._network_running = False
+            self.net_city_btn.setEnabled(True)
+            logger.exception("region_city_worker_start_failed")
+            QMessageBox.warning(self, "联网识别失败", f"无法启动后台任务：{exc}")
+            return
         self.status_label.setText("联网识别中，请稍候...")
 
-    def _on_region_cities_detected(self, shop_to_city):
+    def _on_region_progress(self, worker, message):
+        """Update status only while the corresponding request is active."""
+        try:
+            if (worker is not self._region_worker or not self._network_running
+                    or not hasattr(self, "status_label")):
+                return
+            self.status_label.setText(str(message))
+        except Exception:
+            logger.exception("region_progress_callback_failed")
+
+    def _on_region_cities_detected(self, worker, payload=None):
+        """Guard the Qt slot so callback errors never abort the process."""
+        if payload is None:
+            # Backward-compatible direct invocation used by older helpers.
+            payload, worker = worker, self._region_worker
+        try:
+            self._on_region_cities_detected_impl(worker, payload)
+        except Exception:
+            logger.exception("region_city_callback_failed")
+            self._network_running = False
+            try:
+                self.net_city_btn.setEnabled(True)
+                self.status_label.setText(
+                    "联网识别失败，详细信息已写入日志")
+                QMessageBox.critical(
+                    self, "联网识别失败",
+                    "联网识别阶段发生异常，程序已继续运行。\n"
+                    "请查看 application.log 后重试。",
+                )
+            except Exception:
+                logger.exception("region_city_error_dialog_failed")
+
+    def _on_region_cities_detected_impl(self, worker, payload):
         """Apply safe decisions, then offer ambiguous candidates for review."""
+        if worker is not self._region_worker:
+            logger.warning("region_callback_ignored_stale_worker")
+            return
+        self._network_running = False
+        self.net_city_btn.setEnabled(True)
+
+        if not isinstance(payload, dict):
+            raise TypeError("联网识别返回了无效结果")
+        is_envelope = {
+            "results", "network_shops", "review_decisions",
+            "restrict_cities",
+        }.issubset(payload)
+        if is_envelope:
+            shop_to_city = payload.get("results") or {}
+            network_shops = set(payload.get("network_shops") or ())
+            review_decisions = payload.get("review_decisions") or {}
+            allowed = set(payload.get("restrict_cities") or ())
+            error = payload.get("error") or ""
+            cancelled = bool(payload.get("cancelled"))
+        else:
+            # Accept the pre-2026-09 callback shape for local integrations.
+            shop_to_city = payload
+            network_shops = set(getattr(worker, "network_shops", ()))
+            review_decisions = getattr(worker, "review_decisions", {}) or {}
+            allowed = set(getattr(worker, "restrict_cities", ()))
+            error = ""
+            cancelled = False
+        if error:
+            logger.error("region_city_worker_error: %s", error)
+            self.status_label.setText("联网识别失败，可检查网络后重试")
+            return
+        if cancelled:
+            self.status_label.setText("联网识别已取消")
+            return
         if not self._network_request_id:
             self.status_label.setText("联网识别完成，但审计请求不存在")
             return
-        allowed = set(
-            getattr(getattr(self, "_region_worker", None), "restrict_cities", set()))
         if not allowed:
             logger.warning(
                 "region_callback ignored results because no selected cities were retained")
             self.status_label.setText("联网识别未找到任何城市")
             return
 
-        network_shops = set(
-            getattr(getattr(self, "_region_worker", None), "network_shops", []))
-        review_decisions = getattr(
-            getattr(self, "_region_worker", None), "review_decisions", {}) or {}
         manual_mappings = {}
         candidate_cities = {}
         for shop_name in network_shops:
@@ -1701,11 +1831,35 @@ class MainWindow(QWidget):
                 pass
         self._temp_dirs.clear()
 
+    def _stop_background_workers(self):
+        """Stop background work before Qt destroys the window."""
+        for name in ("ocr_worker", "_region_worker"):
+            worker = getattr(self, name, None)
+            try:
+                running = bool(worker and worker.isRunning())
+            except Exception:
+                running = False
+            if not running:
+                continue
+            try:
+                worker.cancel()
+                if not worker.wait(3000):
+                    logger.warning("background_worker_stop_timeout name=%s", name)
+                    return False
+            except Exception:
+                logger.exception("background_worker_stop_failed name=%s", name)
+                return False
+        return True
+
     def closeEvent(self, event):
-        """窗口关闭时清理临时文件"""
-        if self.ocr_worker and self.ocr_worker.isRunning():
-            self.ocr_worker.cancel()
-            self.ocr_worker.wait(3000)
+        """窗口关闭时先停止线程，再清理临时文件。"""
+        if not self._stop_background_workers():
+            event.ignore()
+            try:
+                self.status_label.setText("正在停止后台任务，请稍候再关闭窗口")
+            except Exception:
+                pass
+            return
         self._cleanup_temp_dirs()
         super().closeEvent(event)
 
@@ -2502,6 +2656,48 @@ class MainWindow(QWidget):
             )
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
+
+    def _convert_store_check(self):
+        """把巡查表转换为总部供货渠道门店价格检查表。"""
+        default_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output"
+        )
+        if not os.path.isdir(default_dir):
+            default_dir = os.path.expanduser("~/Desktop")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择巡查表 Excel 文件",
+            default_dir,
+            "Excel 文件 (*.xlsx);;所有文件 (*)",
+        )
+        if not file_path:
+            return
+        output_dir = os.path.dirname(file_path)
+        self.status_label.setText("正在转换门店价格检查表...")
+        QApplication.processEvents()
+        try:
+            result = store_check_converter.convert_inspection_to_store_check(
+                file_path, output_dir=output_dir
+            )
+            _open_folder(output_dir)
+            pending_text = (
+                f"\n待确认事项：{len(result.pending)} 条（详见‘待确认清单’工作表）"
+                if result.pending
+                else ""
+            )
+            QMessageBox.information(
+                self,
+                "转换成功",
+                f"已生成 {len(result.rows)} 行门店价格检查表：\n"
+                f"{result.output_path}{pending_text}",
+            )
+            self.status_label.setText(
+                f"门店价格检查表已生成：{os.path.basename(result.output_path)}"
+            )
+        except Exception as exc:
+            logger.exception("store_check_conversion_failed")
+            self.status_label.setText("")
+            QMessageBox.critical(self, "转换失败", str(exc))
 
     def _generate_summary(self):
         """从已导出的巡查表xlsx生成分省/分地级市汇总 + 明细表(含截图)"""
