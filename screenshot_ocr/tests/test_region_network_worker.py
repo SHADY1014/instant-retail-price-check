@@ -85,6 +85,15 @@ class RegionNetworkWorkerTests(unittest.TestCase):
 
         info.assert_called_once()
 
+    def test_manual_city_review_is_saved_to_learning_database(self):
+        window = main.MainWindow.__new__(main.MainWindow)
+        import database
+        with patch.object(database, "learn_correction") as learn:
+            window._learn_network_city_reviews({"甲店": "南宁市"})
+        learn.assert_called_once_with(
+            "甲店", "甲店", "南宁市",
+            operator="network-review", source="manual")
+
 
 if __name__ == "__main__":
     unittest.main()

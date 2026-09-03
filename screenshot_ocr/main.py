@@ -1656,6 +1656,25 @@ class MainWindow(QWidget):
                 )
         return updated, rejected
 
+    def _learn_network_city_reviews(self, shop_to_city):
+        """Persist only cities explicitly selected by the user in review."""
+        if not shop_to_city:
+            return
+        try:
+            import database
+            for shop_name, city in shop_to_city.items():
+                database.learn_correction(
+                    shop_name, shop_name, city,
+                    operator="network-review", source="manual")
+        except Exception:
+            logger.exception(
+                "network_city_manual_review_save_failed shops=%d",
+                len(shop_to_city))
+            QMessageBox.warning(
+                self, "知识库保存失败",
+                "已填入表格，但人工确认结果未能保存到知识库。"
+                "请检查日志后重试。")
+
     def _on_files_added(self, files):
         """处理拖拽或选择的文件，自动识别图片和压缩包"""
         image_exts = (".png", ".jpg", ".jpeg", ".webp")

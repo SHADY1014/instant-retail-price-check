@@ -1,5 +1,11 @@
 # 开发日志
 
+## 2026-09-03 · 修复联网城市确认后的知识库保存异常
+
+### 修复
+- 补齐 macOS `MainWindow._learn_network_city_reviews`，人工确认联网城市后可正常写入学习库，不再出现 `AttributeError`。
+- Windows 端同步增加回归测试，确保两端在人工确认后均调用 `database.learn_correction`。
+
 ## 2026-09-03 · 巡查表转换门店价格检查表
 
 ### 新增
