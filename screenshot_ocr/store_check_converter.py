@@ -136,8 +136,9 @@ def _clean_shop_name(shop_name: str) -> str:
     for _ in range(3):
         text = re.sub(r"^(?:闪购|秒送|自营秒送|自营|连锁)\s*", "", text)
     text = text.replace("-啤酒小站", "").replace("啤酒小站", "")
-    # 行政区前缀只在括号内部剥离，避免误删品牌名。
-    text = re.sub(r"([\(])[一-鿿]{1,8}区", r"\1", text)
+    # 只剥离常见的两三字行政区前缀（如“盘龙区”），避免把“滇池度假区”
+    # 这类真实片区名误截断。
+    text = re.sub(r"([\(])[一-鿿]{1,3}区", r"\1", text)
     if text.count("(") > text.count(")"):
         text += ")" * (text.count("(") - text.count(")"))
     # 输出统一使用中文全角括号，避免同一片区因括号形态不同出现重复。
@@ -158,6 +159,14 @@ def normalize_shop_name(shop_name: str) -> tuple[str, str]:
             break
     area = area.strip(" -") or cleaned
     return area, cleaned
+
+
+def _shop_group_key(display_name: str, area_key: str) -> str:
+    """生成“连锁 + 片区”组合键，避免不同连锁同名片区被误合并。"""
+    chain = display_name.split("（", 1)[0].strip(" -")
+    # “啤酒小站”是京东酒世界的挂牌中缀，不应把它拆成另一家连锁。
+    chain = re.sub(r"[- ]*啤酒小站$", "", chain).strip(" -")
+    return f"{chain}|{area_key}" if chain else area_key
 
 
 def _normalize_product_name(value: Any) -> str:
@@ -313,7 +322,8 @@ def parse_source_workbook(xlsx_path: str) -> tuple[list[SourceRecord], list[str]
             if not image_value:
                 image_value = formula_ws.cell(row, 15).value
             image_bytes = images.get(_image_id(image_value))
-            key, display = normalize_shop_name(shop)
+            area_key, display = normalize_shop_name(shop)
+            key = _shop_group_key(display, area_key)
             records.append(
                 SourceRecord(
                     row_number=row,
@@ -358,6 +368,10 @@ def merge_records(
     def display_for(key: str) -> str:
         if shop_name_mapping and key in shop_name_mapping:
             return str(shop_name_mapping[key])
+        # 兼容配置文件只维护片区键（未带“连锁|”前缀）的旧写法。
+        area_key = key.rsplit("|", 1)[-1]
+        if shop_name_mapping and area_key in shop_name_mapping:
+            return str(shop_name_mapping[area_key])
         return first_shop.get(key, key)
 
     sold_groups: OrderedDict[tuple[str, str, str], dict[str, SourceRecord]] = (

@@ -24,6 +24,9 @@ class StoreCheckConverterTest(unittest.TestCase):
         key, display = normalize_shop_name("秒送 京东酒世界（富春花园云仓店）")
         self.assertEqual(key, "富春花园")
         self.assertEqual(display, "京东酒世界（富春花园云仓店）")
+        key, display = normalize_shop_name("京东酒世界（滇池度假区仓店）")
+        self.assertEqual(key, "滇池度假区")
+        self.assertEqual(display, "京东酒世界（滇池度假区仓店）")
 
     def test_spec_normalization(self):
         self.assertEqual(extract_spec("燕京U8 500ml×12罐"), "500ml*12听")
@@ -53,6 +56,30 @@ class StoreCheckConverterTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].platform_values["美团闪购"].final_price, 38)
         self.assertEqual(rows[0].status, "是")
+
+    def test_different_chains_same_area_are_not_merged(self):
+        records = []
+        for row, shop in enumerate(
+            ("京东酒世界（南亚店）", "另一连锁（南亚店）"), start=1
+        ):
+            area, display = normalize_shop_name(shop)
+            records.append(
+                SourceRecord(
+                    row_number=row,
+                    region="昆明市",
+                    shop_name=shop,
+                    platform="美团闪购",
+                    product_name="燕京U8 500ml*6瓶",
+                    spec="500ml*6瓶",
+                    final_price=30,
+                    theory_price=30,
+                    shop_key=f"{display.split('（', 1)[0]}|{area}",
+                    display_name=display,
+                )
+            )
+        rows, pending, _ = merge_records(records)
+        self.assertFalse(pending)
+        self.assertEqual(len(rows), 2)
 
     def test_1998_province_thresholds(self):
         self.assertEqual(
