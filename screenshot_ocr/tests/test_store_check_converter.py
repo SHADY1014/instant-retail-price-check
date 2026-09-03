@@ -94,6 +94,9 @@ class StoreCheckConverterTest(unittest.TestCase):
             threshold_for("漓泉1998 500ml*6瓶", "500ml*6瓶", "广东省"),
             29.9,
         )
+        self.assertIsNone(
+            threshold_for("漓泉1998 500ml*12瓶", "500ml*12瓶", "未知市")
+        )
 
     def test_real_workbook_parse_and_output_integrity(self):
         root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))

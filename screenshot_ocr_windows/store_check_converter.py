@@ -240,6 +240,10 @@ def threshold_for(
         province_rules = DEFAULT_1998_PROVINCE_THRESHOLDS.get(province)
         if province_rules and count in province_rules:
             return float(province_rules[count])
+        # 1998 的 12 瓶/听是广东/广西双口径；未知省份不能静默套用
+        # 通用线，必须进入待确认清单。
+        if count == 12:
+            return None
     rules = configured.get(product_type, {})
     value = rules.get(count)
     return float(value) if value is not None else None
